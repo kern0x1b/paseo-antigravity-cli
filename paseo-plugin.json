@@ -1,6 +1,5 @@
 {
   "id": "antigravity-cli",
-  "description": "Use Google's Antigravity CLI (agy) as a Paseo provider: streaming turns, tool rows with diffs, images, structured output, skills, and opt-in MCP sharing.",
   "requirements": {
     "paseo": ">=0.9.1"
   }
