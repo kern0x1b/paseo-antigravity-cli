@@ -1,4 +1,13 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +17,7 @@ import type {
   ProviderInput,
   ProviderPersistence,
   ProviderSessionConfig,
+  ProviderSetting,
   ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -22,6 +32,8 @@ const OFFERED = [
   "session.persistence",
   "permission.tool_policy",
 ];
+
+const originalHome = process.env.HOME;
 
 let tempDir: string;
 let argvFile: string;
@@ -54,9 +66,22 @@ afterEach(async () => {
     "FAKE_SCENARIO",
     "FAKE_MODELS_OK",
     "FAKE_CONVERSATION_ID",
+    "FAKE_STDERR_LINE",
+    "FAKE_RESULT_ERROR",
+    "FAKE_TOOL_END",
+    "FAKE_RESULT_INPUT_TOKENS",
+    "FAKE_STEP_INPUT_TOKENS",
+    "FAKE_EDIT_FILE",
+    "FAKE_EDIT_TOOL",
+    "FAKE_EDIT_AFTER",
+    "FAKE_EDIT_GATE",
+    "FAKE_EDIT_SKIP_WRITE",
   ]) {
     delete process.env[key];
   }
+  // The approval description is read from HOME, so a test that repoints it must not leak.
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -140,6 +165,12 @@ function turns(events: ProviderEvent[], state: string, sessionId = "session-1") 
   );
 }
 
+function turnIds(events: ProviderEvent[], state: string): string[] {
+  return events.flatMap((event) =>
+    event.type === "session.turn" && event.state === state ? [event.turnId] : [],
+  );
+}
+
 function timelineItems(events: ProviderEvent[]): ProviderTimelineItem[] {
   return events.flatMap((event) => (event.type === "timeline.item" ? [event.item] : []));
 }
@@ -211,10 +242,11 @@ describe("session lifecycle", () => {
       "0",
       "--model",
       "gemini-3.8-flash-high",
-      "--dangerously-skip-permissions",
     ]) {
       expect(argv).toContain(flag);
     }
+    // Approval follows Antigravity's own setting unless the user picks otherwise.
+    expect(argv).not.toContain("--dangerously-skip-permissions");
     expect(argv).not.toContain("-p");
     expect(argv).not.toContain("--print");
     // `default` is agy's implicit mode, so it must not be passed explicitly.
@@ -234,19 +266,6 @@ describe("session lifecycle", () => {
     expect(argv[argv.indexOf("--mode") + 1]).toBe("plan");
   });
 
-  it("omits the approval flag when auto-approve is turned off", async () => {
-    const { connection, events } = await connect();
-    await openSession(connection, { settings: { autoApprove: false } });
-    await prompt(connection, "hello");
-    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
-
-    expect(readArgv()).not.toContain("--dangerously-skip-permissions");
-    const config = events.find((event) => event.type === "session.config");
-    expect(config).toMatchObject({
-      config: { settings: [expect.objectContaining({ id: "autoApprove", value: false })] },
-    });
-  });
-
   it("reports the model and mode selectors in the committed config", async () => {
     const { connection, events } = await connect();
     await openSession(connection);
@@ -263,6 +282,201 @@ describe("session lifecycle", () => {
     if (config?.type === "session.config") {
       expect(config.config.models.length).toBeGreaterThan(0);
     }
+  });
+
+  it("ignores an init event whose conversation id is empty", async () => {
+    process.env.FAKE_CONVERSATION_ID = "";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // An unnamed conversation must not be persisted, nor adopted as the session's identity.
+    expect(events.some((event) => event.type === "session.persistence")).toBe(false);
+
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed"),
+      "the session to close",
+    );
+    const transcripts = join(
+      process.env.PASEO_HOME ?? "",
+      "plugin-data",
+      "antigravity-cli",
+      "transcripts",
+    );
+    // The empty id names this file; a stray file from another session's store is not ours.
+    expect(existsSync(join(transcripts, ".jsonl"))).toBe(false);
+  });
+});
+
+describe("tool approval", () => {
+  function approvalSetting(events: ProviderEvent[]): ProviderSetting | undefined {
+    const config = events.filter((event) => event.type === "session.config").at(-1);
+    return config?.type === "session.config"
+      ? config.config.settings.find((setting) => setting.id === "approvalPolicy")
+      : undefined;
+  }
+
+  it("offers Antigravity's own setting as the default policy", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(approvalSetting(events)).toMatchObject({
+      type: "select",
+      value: "agy",
+      options: [
+        { label: "Use Antigravity setting", value: "agy" },
+        { label: "Skip all permissions", value: "skip" },
+      ],
+    });
+    expect(readArgv()).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("adds the skip flag on the next turn after the policy is switched", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the first turn");
+    expect(readArgv()).not.toContain("--dangerously-skip-permissions");
+
+    await connection.send({
+      type: "session.configure",
+      requestId: "cfg-1",
+      sessionId: "session-1",
+      changes: { settings: { approvalPolicy: "skip" } },
+    } as ProviderInput);
+
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the second turn");
+
+    expect(readArgv()).toContain("--dangerously-skip-permissions");
+    expect(approvalSetting(events)).toMatchObject({ value: "skip" });
+  });
+
+  it("treats a persisted autoApprove setting as skip", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { settings: { autoApprove: true } });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(readArgv()).toContain("--dangerously-skip-permissions");
+    expect(approvalSetting(events)).toMatchObject({ value: "skip" });
+  });
+
+  it("names the Antigravity toolPermission that will decide approval", async () => {
+    const home = join(tempDir, "home");
+    mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+    writeFileSync(
+      join(home, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ toolPermission: "request-review" }),
+    );
+    process.env.HOME = home;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+
+    expect(approvalSetting(events)).toMatchObject({
+      description: expect.stringContaining("request-review"),
+    });
+  });
+
+  it("says unknown when Antigravity's settings cannot be read", async () => {
+    const missing = join(tempDir, "empty-home");
+    const invalid = join(tempDir, "invalid-home");
+    mkdirSync(join(invalid, ".gemini", "antigravity-cli"), { recursive: true });
+    writeFileSync(join(invalid, ".gemini", "antigravity-cli", "settings.json"), "{ not json");
+
+    for (const home of [missing, invalid]) {
+      mkdirSync(home, { recursive: true });
+      process.env.HOME = home;
+      const { connection, events } = await connect();
+      await openSession(connection);
+
+      expect(approvalSetting(events)).toMatchObject({
+        description: expect.stringContaining("unknown"),
+      });
+    }
+  });
+});
+
+describe("usage", () => {
+  function lastUsage(events: ProviderEvent[]) {
+    const usage = events.filter((event) => event.type === "session.usage").at(-1);
+    return usage?.type === "session.usage" ? usage.usage : undefined;
+  }
+
+  it("reports the last step's input tokens as the context occupancy", async () => {
+    // Captured shape: the result totals every step (31074 = 15388 + 15686) while the final step
+    // reports what the model actually held in its context window.
+    process.env.FAKE_RESULT_INPUT_TOKENS = "31074";
+    process.env.FAKE_STEP_INPUT_TOKENS = "15686";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(lastUsage(events)).toMatchObject({
+      inputTokens: 31074,
+      outputTokens: 52,
+      contextWindowUsedTokens: 15686,
+    });
+  });
+
+  it("omits the context occupancy when no step reported usage", async () => {
+    process.env.FAKE_SCENARIO = "error";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    const usage = lastUsage(events);
+    expect(usage).toMatchObject({ inputTokens: 15466 });
+    expect(usage).not.toHaveProperty("contextWindowUsedTokens");
+  });
+});
+
+describe("queued prompts", () => {
+  it("keeps a queued prompt from truncating the running answer", async () => {
+    process.env.FAKE_SCENARIO = "queued";
+    const { connection, events } = await connect();
+    await openSession(connection);
+
+    await prompt(connection, "one", "m1");
+    // The fake streams half of turn 1's answer and then waits for a second stdin line, so the
+    // queued prompt below lands while that turn is still running.
+    await waitFor(
+      () => timelineItems(events).find((item) => item.type === "assistant_message"),
+      "turn 1 to start streaming",
+    );
+    await prompt(connection, "two", "m2");
+
+    await waitFor(
+      () => (turnIds(events, "completed").length === 2 ? true : undefined),
+      "both turns to complete",
+    );
+
+    const assistant = timelineItems(events).filter((item) => item.type === "assistant_message");
+    const firstId = assistant[0]?.id;
+    const firstRow = assistant.filter((item) => item.id === firstId);
+    expect(firstRow[0]).toMatchObject({ text: "echo" });
+    // Turn 1 keeps one row, and its last snapshot is the whole answer, not the pre-queue prefix.
+    expect(firstRow.at(-1)).toMatchObject({ text: "echo:one\n" });
+
+    // One row per turn, each carrying its own turn id, and one completion per turn in order.
+    const startedIds = turnIds(events, "started");
+    expect(startedIds).toHaveLength(2);
+    expect(turnIds(events, "completed")).toEqual(startedIds);
+    expect(new Set(assistant.map((item) => item.id)).size).toBe(2);
+
+    expect(firstId).toContain(startedIds[0]);
+    const secondRow = assistant.find((item) => item.id !== firstId);
+    expect(secondRow?.id).toContain(startedIds[1]);
+    expect(assistant.filter((item) => item.id === secondRow?.id).at(-1)).toMatchObject({
+      text: "echo:two\n",
+    });
   });
 });
 
@@ -370,6 +584,200 @@ describe("tool calls", () => {
       detail: { type: "shell", command: "ls -la", output: "hello.txt" },
     });
   });
+
+  it("republishes a tool call left running as canceled when the turn is interrupted", async () => {
+    process.env.FAKE_SCENARIO = "tool-hang";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "run sleep 30");
+    await waitFor(
+      () => timelineItems(events).find((item) => item.type === "tool_call"),
+      "the tool row to appear",
+    );
+
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
+    await waitFor(() => turns(events, "canceled")[0], "the turn to be canceled");
+
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "canceled"]);
+    expect(calls[1]).toMatchObject({ id: calls[0]?.id, error: null });
+  });
+
+  it("republishes a tool call left running as failed when the turn fails", async () => {
+    process.env.FAKE_SCENARIO = "tool-hang";
+    process.env.FAKE_TOOL_END = "error";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "run sleep 30");
+    await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "failed"]);
+    expect(calls[1]).toMatchObject({
+      id: calls[0]?.id,
+      error: {
+        message: "Eligibility check failed: the service is currently unavailable.",
+        code: "ERROR",
+      },
+    });
+  });
+
+  it("republishes a tool call left running as failed when the process dies", async () => {
+    process.env.FAKE_SCENARIO = "tool-hang";
+    process.env.FAKE_TOOL_END = "die";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "run sleep 30");
+    await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "failed"]);
+    expect(calls[1]).toMatchObject({
+      id: calls[0]?.id,
+      error: { message: expect.stringContaining("closed the connection"), code: "agy_exit" },
+    });
+  });
+});
+
+describe("edit diffs", () => {
+  function toolRows(events: ProviderEvent[]) {
+    return timelineItems(events).filter((item) => item.type === "tool_call");
+  }
+
+  /** The streamed row arrives path-only; the diff lands when both snapshots are read. */
+  async function rowWithEditDiff(events: ProviderEvent[]) {
+    return waitFor(() => {
+      const last = toolRows(events).at(-1);
+      return last?.detail.type === "edit" && last.detail.unifiedDiff !== undefined
+        ? last
+        : undefined;
+    }, "the edit row to carry a diff");
+  }
+
+  /**
+   * The fake holds its rewrite until this file exists, so the consumer has certainly read the
+   * file before the tool changes it. No timing guess is involved.
+   */
+  async function releaseEdit(events: ProviderEvent[], gate: string, name = "replace_file_content") {
+    await waitFor(
+      () => toolRows(events).find((item) => item.name === name),
+      `the ${name} row`,
+    );
+    writeFileSync(gate, "");
+  }
+
+  it("diffs a file the stream only named", async () => {
+    process.env.FAKE_SCENARIO = "edit";
+    const file = join(tempDir, "hello.txt");
+    writeFileSync(file, "hello world\n");
+    const gate = join(tempDir, "gate");
+    process.env.FAKE_EDIT_FILE = file;
+    process.env.FAKE_EDIT_GATE = gate;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "change hello to bye");
+    await releaseEdit(events, gate);
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const diff = (await rowWithEditDiff(events)).detail;
+    expect(diff).toMatchObject({
+      type: "edit",
+      filePath: file,
+      unifiedDiff: [
+        "--- a/hello.txt",
+        "+++ b/hello.txt",
+        "@@ -1,1 +1,1 @@",
+        "-hello world",
+        "+bye world",
+      ].join("\n"),
+    });
+
+    // The diff republishes the same row rather than adding one: Paseo replaces a row by id.
+    const calls = toolRows(events);
+    expect(calls.map((item) => item.status)).toEqual(["running", "completed", "completed"]);
+    expect(new Set(calls.map((item) => item.id)).size).toBe(1);
+    expect(calls[2]).toMatchObject({ id: calls[0]?.id, callId: calls[0]?.callId });
+  });
+
+  it("diffs an edit against the content an earlier step showed", async () => {
+    // agy applies an edit before its step is deliverable, so the file already holds the new text
+    // when the step arrives; only the content a previous step showed can describe the change.
+    process.env.FAKE_SCENARIO = "edit-applied";
+    const file = join(tempDir, "hello.txt");
+    writeFileSync(file, "hello world\n");
+    const gate = join(tempDir, "gate");
+    process.env.FAKE_EDIT_FILE = file;
+    process.env.FAKE_EDIT_GATE = gate;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "change hello to bye");
+    await releaseEdit(events, gate, "view_file");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const diff = (await rowWithEditDiff(events)).detail;
+    expect(diff).toMatchObject({ type: "edit", filePath: file });
+    expect(diff.type === "edit" ? diff.unifiedDiff : "").toBe(
+      ["--- a/hello.txt", "+++ b/hello.txt", "@@ -1,1 +1,1 @@", "-hello world", "+bye world"].join(
+        "\n",
+      ),
+    );
+  });
+
+  it("publishes the content of a file that write_to_file creates", async () => {
+    process.env.FAKE_SCENARIO = "edit";
+    process.env.FAKE_EDIT_TOOL = "write_to_file";
+    process.env.FAKE_EDIT_AFTER = "alpha\n";
+    const file = join(tempDir, "notes.txt");
+    const gate = join(tempDir, "gate");
+    process.env.FAKE_EDIT_FILE = file;
+    process.env.FAKE_EDIT_GATE = gate;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "create notes.txt");
+    await releaseEdit(events, gate, "write_to_file");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const row = await waitFor(() => {
+      const last = toolRows(events).at(-1);
+      return last?.detail.type === "write" && last.detail.content !== undefined ? last : undefined;
+    }, "the write row to carry the new file's content");
+
+    expect(row).toMatchObject({
+      status: "completed",
+      detail: { type: "write", filePath: file, content: "alpha\n" },
+    });
+  });
+
+  it("keeps the streamed detail when the file cannot be compared", async () => {
+    process.env.FAKE_SCENARIO = "edit";
+    // The step reports success without touching the binary file, so neither snapshot is text and
+    // no diff can ever be published, whatever the ordering.
+    process.env.FAKE_EDIT_SKIP_WRITE = "1";
+    const file = join(tempDir, "image.png");
+    writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]));
+    process.env.FAKE_EDIT_FILE = file;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "edit the image");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // A second turn is the barrier: a republish for the first would have landed by now.
+    await prompt(connection, "and again", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the second turn to complete");
+
+    const calls = toolRows(events);
+    expect(calls.map((item) => item.status)).toEqual([
+      "running",
+      "completed",
+      "running",
+      "completed",
+    ]);
+    expect(calls[1]?.detail).toEqual({ type: "edit", filePath: file });
+  });
 });
 
 describe("failures", () => {
@@ -385,6 +793,58 @@ describe("failures", () => {
     });
   });
 
+  it("quotes only the stderr of the process that served the turn", async () => {
+    process.env.FAKE_SCENARIO = "fail";
+    process.env.FAKE_STDERR_LINE = "error: the first process failed";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello", "m1");
+    await waitFor(() => turns(events, "failed")[0], "the first turn to fail");
+
+    process.env.FAKE_STDERR_LINE = "error: the second process failed";
+    await prompt(connection, "again", "m2");
+    const second = await waitFor(() => turns(events, "failed")[1], "the second turn to fail");
+
+    expect(second).toMatchObject({
+      error: { code: "agy_exit", message: expect.stringContaining("second process failed") },
+    });
+    expect(second).not.toMatchObject({
+      error: { message: expect.stringContaining("first process failed") },
+    });
+  });
+
+  it("fails a turn written to a CLI whose stdin has closed, then recovers on the next one", async () => {
+    process.env.FAKE_SCENARIO = "stdin-closed";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    // The CLI closes its stdin before reporting init, so nothing will ever answer this turn.
+    await prompt(connection, "stranded", "m1");
+    await waitFor(
+      () => events.find((event) => event.type === "session.persistence"),
+      "the CLI to report init",
+    );
+
+    // The next turn is written into the dead pipe, and refused instead of vanishing.
+    await prompt(connection, "refused", "m2");
+    const refused = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+    expect(refused).toMatchObject({
+      error: { code: "agy_launch_failed", message: expect.stringContaining("EPIPE") },
+    });
+
+    // A live CLI replaces it on the same conversation: the stranded turn ends with the process it
+    // belonged to, and the next turn runs on a fresh process.
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "recovered", "m3");
+    await waitFor(() => turns(events, "completed")[0], "the recovered turn to complete");
+
+    expect(turns(events, "failed")).toHaveLength(2);
+    expect(readPrompts().at(-1)).toBe("recovered");
+    const argv = readArgv();
+    expect(argv[argv.indexOf("--conversation") + 1]).toBe(
+      "11111111-2222-3333-4444-555555555555",
+    );
+  });
+
   it("fails the turn when agy reports an ERROR result", async () => {
     process.env.FAKE_SCENARIO = "error";
     const { connection, events } = await connect();
@@ -394,6 +854,69 @@ describe("failures", () => {
 
     expect(turn).toMatchObject({
       error: { code: "ERROR", message: expect.stringContaining("Eligibility check failed") },
+    });
+    // Neither an AGY_ERROR line nor an outage marker applies, so the status stands and no
+    // retry is suggested.
+    expect(turn).not.toMatchObject({ error: { diagnostic: expect.anything() } });
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-unavailable"),
+    ).toBe(false);
+  });
+
+  it("takes the code and diagnostic from a structured AGY_ERROR line", async () => {
+    // agy 1.2.6+ documents this line; no stream-json capture of ours contains one, so the payload
+    // is the documented shape (canonical status, short error, retryability, error id).
+    process.env.FAKE_SCENARIO = "fail";
+    const report = JSON.stringify({
+      short_error: "model API request failed",
+      status: "UNAVAILABLE",
+      code: "503",
+      retryable: true,
+      error_id: "e-1234",
+    });
+    process.env.FAKE_STDERR_LINE = `AGY_ERROR: ${report}`;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const turn = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(turn).toMatchObject({
+      error: {
+        code: "UNAVAILABLE",
+        message: "model API request failed",
+        diagnostic: report,
+      },
+    });
+    const notice = events.find(
+      (event) => event.type === "session.notice" && event.notice.id === "agy-unavailable",
+    );
+    expect(notice).toMatchObject({ notice: { severity: "warning" } });
+  });
+
+  it("names a captured UNAVAILABLE (code 503) failure and asks for a retry", async () => {
+    process.env.FAKE_SCENARIO = "error";
+    // Copied from fixtures/05-unavailable.ndjson: a real outage during a turn.
+    process.env.FAKE_RESULT_ERROR =
+      "failed to send message: send failed; already reported to the user: Eligibility check failed: failed to get load code assist response: UNAVAILABLE (code 503): The service is currently unavailable.";
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const turn = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(turn).toMatchObject({
+      error: { code: "unavailable", message: expect.stringContaining("UNAVAILABLE (code 503)") },
+    });
+    const notice = events.find(
+      (event) => event.type === "session.notice" && event.notice.id === "agy-unavailable",
+    );
+    expect(notice).toMatchObject({
+      notice: {
+        severity: "warning",
+        title: expect.stringContaining("temporarily unavailable"),
+        description: expect.stringContaining("Retry"),
+      },
     });
   });
 
@@ -510,6 +1033,25 @@ describe("session.configure", () => {
 });
 
 describe("history replay", () => {
+  const CONVERSATION_ID = "11111111-2222-3333-4444-555555555555";
+
+  /** Opens a second connection on the same conversation with `history: "replay"`. */
+  async function replay(conversationId = CONVERSATION_ID): Promise<ProviderEvent[]> {
+    const replayed = await createProvider().connect({ versions: [1], capabilities: OFFERED });
+    openConnections.push(replayed);
+    const events: ProviderEvent[] = [];
+    replayed.onEvent((event) => events.push(event));
+    await replayed.send({
+      type: "session.open",
+      requestId: "open-replay",
+      sessionId: "session-replay",
+      config: sessionConfig(),
+      history: "replay",
+      persistence: { version: 1, data: { conversationId } },
+    } as ProviderInput);
+    return events;
+  }
+
   it("republishes stored rows for a resumed conversation", async () => {
     const { connection, events } = await connect();
     await openSession(connection);
@@ -521,23 +1063,7 @@ describe("history replay", () => {
       "the session to close",
     );
 
-    const replayEvents: ProviderEvent[] = [];
-    const replayed = await createProvider().connect({ versions: [1], capabilities: OFFERED });
-    openConnections.push(replayed);
-    replayed.onEvent((event) => replayEvents.push(event));
-
-    await replayed.send({
-      type: "session.open",
-      requestId: "open-2",
-      sessionId: "session-2",
-      config: sessionConfig(),
-      history: "replay",
-      persistence: {
-        version: 1,
-        data: { conversationId: "11111111-2222-3333-4444-555555555555" },
-      },
-    } as ProviderInput);
-
+    const replayEvents = await replay();
     const replayedItems = timelineItems(replayEvents);
     // The user message is published before agy starts, so this also guards the buffering path.
     expect(replayedItems.some((item) => item.type === "user_message" && item.text === "hello")).toBe(true);
@@ -548,5 +1074,41 @@ describe("history replay", () => {
     const firstTimelineIndex = replayEvents.findIndex((event) => event.type === "timeline.item");
     expect(firstTimelineIndex).toBeGreaterThanOrEqual(0);
     expect(firstTimelineIndex).toBeLessThan(readyIndex);
+  });
+
+  it("flushes the last answer when the connection closes", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the first turn");
+
+    // Closing lands inside the write debounce window, where the answer still lives in memory.
+    await connection.close();
+
+    const replayed = timelineItems(await replay());
+    expect(replayed.filter((item) => item.type === "assistant_message").at(-1)).toMatchObject({
+      text: "echo:hello\n",
+    });
+  });
+
+  it("stores nothing for a session that is not persisted", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { persist: false });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the first turn");
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed"),
+      "the session to close",
+    );
+
+    const transcripts = join(
+      process.env.PASEO_HOME ?? "",
+      "plugin-data",
+      "antigravity-cli",
+      "transcripts",
+    );
+    expect(existsSync(transcripts) ? readdirSync(transcripts) : []).toEqual([]);
+    expect(timelineItems(await replay())).toEqual([]);
   });
 });

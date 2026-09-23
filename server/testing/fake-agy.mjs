@@ -4,12 +4,27 @@
  * (see server/protocol.ts and fixtures/) and can be told which scenario to play through env vars.
  *
  *   FAKE_ARGV_FILE       when set, the received argv is written here so tests can assert flags
- *   FAKE_SCENARIO        text (default) | tool | interrupt | error | fail
+ *   FAKE_SCENARIO        text (default) | tool | edit | queued | interrupt | error | fail
+ *                        | tool-hang | stdin-closed
+ *   FAKE_EDIT_FILE       file an `edit` turn rewrites (default <cwd>/hello.txt)
+ *   FAKE_EDIT_TOOL       tool an `edit` turn reports (default replace_file_content)
+ *   FAKE_EDIT_AFTER      content the edit writes (default "bye world\n")
+ *   FAKE_EDIT_GATE       file the rewrite waits for, so the test decides when the edit lands
+ *   FAKE_EDIT_SKIP_WRITE "1" reports the edit without writing anything
  *   FAKE_CONVERSATION_ID conversation id reported by the init event
+ *   FAKE_STDERR_LINE     diagnostic written by the `fail` scenario
+ *   FAKE_RESULT_ERROR    text of the failed result in the `error` scenario and in `tool-hang`
+ *                        with FAKE_TOOL_END=error
+ *   FAKE_TOOL_END        how `tool-hang` ends the turn: interrupt (default) | error | die
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
+ *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
+ *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
+ *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
  */
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import readline from "node:readline";
+import { PassThrough } from "node:stream";
 
 const argv = process.argv.slice(2);
 
@@ -18,6 +33,9 @@ if (process.env.FAKE_ARGV_FILE) {
 }
 
 if (argv[0] === "models") {
+  if (process.env.FAKE_MODELS_LOG) {
+    appendFileSync(process.env.FAKE_MODELS_LOG, "models\n", "utf8");
+  }
   if (process.env.FAKE_MODELS_OK === "1") {
     process.stdout.write("Fetching available models...\n");
     process.stdout.write("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n");
@@ -31,22 +49,117 @@ if (argv[0] === "models") {
 const conversationId = process.env.FAKE_CONVERSATION_ID ?? "11111111-2222-3333-4444-555555555555";
 const scenario = process.env.FAKE_SCENARIO ?? "text";
 
+/** Mirrors a captured 503: agy fails the turn and quotes the service error to the user. */
+const defaultResultError = "Eligibility check failed: the service is currently unavailable.";
+
 const send = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
 
 const usage = {
-  input_tokens: 15466,
+  input_tokens: Number(process.env.FAKE_RESULT_INPUT_TOKENS ?? 15466),
   output_tokens: 27,
   thinking_tokens: 25,
   cache_read_tokens: 0,
   total_tokens: 15518,
 };
 
+/**
+ * The result totals every step of the turn, while a step reports what the model held in its
+ * context window, which is why the two are configurable apart (captured: 31074 = 15388 + 15686).
+ */
+const stepUsage = {
+  ...usage,
+  input_tokens: Number(process.env.FAKE_STEP_INPUT_TOKENS ?? usage.input_tokens),
+};
+
 let step = 0;
 let turns = 0;
 
+/**
+ * Holds the `edit` scenarios until the test lets the change land. Polling a file is the only
+ * channel between a test and this process; there is no timing guess and no sleep to speak of.
+ */
+async function waitForGate() {
+  const gate = process.env.FAKE_EDIT_GATE;
+  if (!gate) return;
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(gate) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+// The queued scenario holds turn 1's answer until the second line arrives.
+let heldAnswer = null;
+
+const stepEvent = (stepIndex, state, stepType, extra = {}) => ({
+  event: "step_update",
+  step_update: {
+    conversation_id: conversationId,
+    step_index: stepIndex,
+    state,
+    step_type: stepType,
+    ...extra,
+  },
+});
+
+const resultEvent = (numTurns, response, status = "SUCCESS", error) => ({
+  event: "result",
+  result: {
+    conversation_id: conversationId,
+    status,
+    response,
+    ...(error ? { error } : {}),
+    num_turns: numTurns,
+    usage,
+  },
+});
+
+/**
+ * Turn 1 streams half an answer and then waits for the queued line before finishing, the order agy
+ * uses when a prompt arrives while it is still running (see fixtures/04-queued-second-line.ndjson).
+ */
+function playQueued(text) {
+  const response = `echo:${text}`;
+  const middle = Math.max(1, Math.floor(response.length / 2));
+
+  if (heldAnswer === null) {
+    send(stepEvent(step, "DONE", "user_input"));
+    step += 1;
+    const textStep = step;
+    step += 1;
+    send(stepEvent(textStep, "ACTIVE", "agent_response", { text_delta: response.slice(0, middle) }));
+    heldAnswer = { textStep, response, offset: middle };
+    return;
+  }
+
+  const held = heldAnswer;
+  heldAnswer = null;
+  // The held turn's remaining text and its result both precede the queued turn.
+  send(
+    stepEvent(held.textStep, "DONE", "agent_response", {
+      text_delta: `${held.response.slice(held.offset)}\n`,
+      usage: stepUsage,
+    }),
+  );
+  send(resultEvent(1, `${held.response}\n`));
+
+  send(stepEvent(step, "DONE", "user_input"));
+  step += 1;
+  const textStep = step;
+  step += 1;
+  send(stepEvent(textStep, "ACTIVE", "agent_response", { text_delta: response.slice(0, middle) }));
+  send(
+    stepEvent(textStep, "DONE", "agent_response", {
+      text_delta: `${response.slice(middle)}\n`,
+      usage: stepUsage,
+    }),
+  );
+  send(resultEvent(2, `${response}\n`));
+}
+
 // Registered before any output is written, so a consumer that has seen `init` can rely on
 // SIGINT being handled rather than terminating the process by default.
-if (scenario === "interrupt") {
+const toolEnding = process.env.FAKE_TOOL_END ?? "interrupt";
+if (scenario === "interrupt" || (scenario === "tool-hang" && toolEnding === "interrupt")) {
   // Captured behaviour: SIGINT prints `error: interrupted` on stderr, emits a failed result
   // carrying the same marker, then exits with code 1.
   process.on("SIGINT", () => {
@@ -70,6 +183,15 @@ if (scenario === "interrupt") {
   });
 }
 
+// A CLI whose stdin has already closed reads nothing more: `stdin-closed` closes the pipe before
+// reporting init, so a turn written afterwards hits a dead pipe, and a listening socket keeps the
+// process up.
+const stdinGone = scenario === "stdin-closed";
+if (stdinGone) {
+  closeSync(0);
+  createServer().listen(0);
+}
+
 send({
   event: "init",
   conversation_id: conversationId,
@@ -80,7 +202,8 @@ send({
   },
 });
 
-readline.createInterface({ input: process.stdin }).on("line", (line) => {
+const input = stdinGone ? new PassThrough() : process.stdin;
+readline.createInterface({ input }).on("line", async (line) => {
   const trimmed = line.trim();
   if (trimmed.length === 0) return;
 
@@ -106,8 +229,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 
   if (scenario === "fail") {
     // Mirrors a rejected --model: agy writes to stderr and exits without a result event.
-    process.stderr.write("error: invalid model selection: model nope is not recognized\n");
+    process.stderr.write(
+      `${process.env.FAKE_STDERR_LINE ?? "error: invalid model selection: model nope is not recognized"}\n`,
+    );
     process.exit(1);
+  }
+
+  if (scenario === "queued") {
+    playQueued(text);
+    return;
   }
 
   turns += 1;
@@ -125,6 +255,26 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   // Stay silent so the turn stays running until the test interrupts it.
   if (scenario === "interrupt") return;
 
+  if (scenario === "tool-hang") {
+    // The tool stays ACTIVE: the turn only ends when the test interrupts it, agy reports an
+    // error, or the process dies.
+    const toolStep = step;
+    step += 1;
+    send(
+      stepEvent(toolStep, "ACTIVE", "tool", {
+        tool_name: "run_command",
+        tool_info: { name: "run_command", parameters: { CommandLine: "sleep 30" } },
+      }),
+    );
+    if (toolEnding === "error") {
+      send(resultEvent(turns, "", "ERROR", process.env.FAKE_RESULT_ERROR ?? defaultResultError));
+    } else if (toolEnding === "die") {
+      process.stderr.write("error: the Antigravity service closed the connection\n");
+      process.exit(1);
+    }
+    return;
+  }
+
   if (scenario === "error") {
     send({
       event: "result",
@@ -132,7 +282,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         conversation_id: conversationId,
         status: "ERROR",
         response: "",
-        error: "Eligibility check failed: the service is currently unavailable.",
+        error: process.env.FAKE_RESULT_ERROR ?? defaultResultError,
         duration_seconds: 0,
         num_turns: turns,
         usage,
@@ -163,6 +313,62 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       text_delta: response.slice(middle),
     },
   });
+
+  if (scenario === "edit" || scenario === "edit-applied") {
+    // The captured shape of an edit: the stream names the file and nothing else, so a consumer
+    // can only describe the change by comparing the file before and after the call.
+    const file = process.env.FAKE_EDIT_FILE ?? `${process.cwd()}/hello.txt`;
+    const toolName = process.env.FAKE_EDIT_TOOL ?? "replace_file_content";
+    const toolInfo = { name: toolName, parameters: { TargetFile: file } };
+
+    if (scenario === "edit-applied") {
+      // agy applies the edit before the step is deliverable, so a consumer only ever sees the
+      // file as a `view_file` step showed it. The gate opens once that step has been seen.
+      send(
+        stepEvent(step, "ACTIVE", "tool", {
+          tool_name: "view_file",
+          tool_info: { name: "view_file", parameters: { AbsolutePath: file } },
+        }),
+      );
+      await waitForGate();
+      send(
+        stepEvent(step, "DONE", "tool", {
+          tool_name: "view_file",
+          tool_info: { name: "view_file", parameters: { AbsolutePath: file } },
+          output: "1 line, 12 bytes",
+          duration_seconds: 0.01,
+        }),
+      );
+      step += 1;
+      if (process.env.FAKE_EDIT_SKIP_WRITE !== "1") {
+        writeFileSync(file, process.env.FAKE_EDIT_AFTER ?? "bye world\n");
+      }
+      send(stepEvent(step, "ACTIVE", "tool", { tool_name: toolName, tool_info: toolInfo }));
+      send(
+        stepEvent(step, "DONE", "tool", {
+          tool_name: toolName,
+          tool_info: toolInfo,
+          duration_seconds: 0.02,
+        }),
+      );
+      step += 1;
+    } else {
+      const toolStep = step;
+      step += 1;
+      send(stepEvent(toolStep, "ACTIVE", "tool", { tool_name: toolName, tool_info: toolInfo }));
+      await waitForGate();
+      if (process.env.FAKE_EDIT_SKIP_WRITE !== "1") {
+        writeFileSync(file, process.env.FAKE_EDIT_AFTER ?? "bye world\n");
+      }
+      send(
+        stepEvent(toolStep, "DONE", "tool", {
+          tool_name: toolName,
+          tool_info: toolInfo,
+          duration_seconds: 0.02,
+        }),
+      );
+    }
+  }
 
   if (scenario === "tool") {
     step += 1;
@@ -201,7 +407,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       step_type: "agent_response",
       text_delta: "\n",
       duration_seconds: 0.1,
-      usage,
+      usage: stepUsage,
     },
   });
   send({

@@ -15,15 +15,22 @@ const WRITE_DEBOUNCE_MS = 250;
 
 export class TranscriptStore {
   private readonly items = new Map<string, ProviderTimelineItem>();
+  /**
+   * Resolved once, not per write: a debounced write can outlive the test or session that created
+   * it, and reading `PASEO_HOME` at write time would then file its rows under a different home.
+   */
+  private readonly path: string;
   private writeTimer: NodeJS.Timeout | null = null;
   private writeChain: Promise<void> = Promise.resolve();
 
-  constructor(private readonly conversationId: string) {}
+  constructor(conversationId: string) {
+    this.path = transcriptPath(conversationId);
+  }
 
   static async load(conversationId: string): Promise<TranscriptStore> {
     const store = new TranscriptStore(conversationId);
     try {
-      const raw = await readFile(transcriptPath(conversationId), "utf8");
+      const raw = await readFile(store.path, "utf8");
       for (const line of raw.split("\n")) {
         const trimmed = line.trim();
         if (trimmed.length === 0) continue;
@@ -79,7 +86,7 @@ export class TranscriptStore {
   }
 
   private async write(): Promise<void> {
-    const path = transcriptPath(this.conversationId);
+    const path = this.path;
     const body = this.list()
       .map((item) => JSON.stringify(item))
       .join("\n");

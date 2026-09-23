@@ -1,9 +1,22 @@
 import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { encodeUserTurn, isInterrupted, parseAgyLine, type AgyEvent } from "./protocol";
+import {
+  encodeUserTurn,
+  isInterrupted,
+  parseAgyErrorLine,
+  parseAgyLine,
+  type AgyEvent,
+} from "./protocol";
 
 const fixturesDir = fileURLToPath(new URL("../fixtures", import.meta.url));
+
+/**
+ * `agy --model does-not-exist` never opens a conversation: it reports one failed result and exits
+ * 1 without an init event (fixtures/05-error.ndjson).
+ */
+const LAUNCH_FAILURE_FIXTURES = ["05-error.ndjson"];
 
 function fixtureNames(): string[] {
   return readdirSync(fixturesDir).filter((name) => name.endsWith(".ndjson"));
@@ -48,6 +61,14 @@ describe("parseAgyLine", () => {
     });
   });
 
+  it("rejects an init event without a usable conversation id", () => {
+    // An eligibility failure reports an empty id, which would name a transcript file ".jsonl".
+    expect(parseAgyLine('{"event":"init","conversation_id":"","init":{"cwd":"/tmp"}}')).toEqual({
+      kind: "unknown",
+      event: "init",
+    });
+  });
+
   it("decodes init with its conversation id and tool list", () => {
     const event = parseAgyLine(
       '{"event":"init","conversation_id":"abc","init":{"cwd":"/tmp","tools":["run_command"],"permission_mode":"always-proceed"}}',
@@ -71,6 +92,38 @@ describe("parseAgyLine", () => {
   });
 });
 
+describe("parseAgyErrorLine", () => {
+  it("reads the documented fields and keeps the JSON verbatim", () => {
+    const line =
+      'AGY_ERROR: {"short_error":"model API request failed","status":"UNAVAILABLE","code":"503","retryable":true,"error_id":"e-1234"}';
+    expect(parseAgyErrorLine(line)).toEqual({
+      status: "UNAVAILABLE",
+      short_error: "model API request failed",
+      retryable: true,
+      raw: line.slice("AGY_ERROR: ".length),
+    });
+  });
+
+  it("ignores an ordinary stderr line, and keeps a decodable one it does not recognise", () => {
+    expect(parseAgyErrorLine("error: invalid model selection")).toBeNull();
+    expect(parseAgyErrorLine("AGY_ERROR: not json")).toBeNull();
+    expect(parseAgyErrorLine("AGY_ERROR: [1,2]")).toBeNull();
+    // Unknown fields survive in `raw`, which is what reaches ProviderError.diagnostic.
+    expect(parseAgyErrorLine('AGY_ERROR: {"something_new":"x"}')).toEqual({
+      raw: '{"something_new":"x"}',
+    });
+  });
+
+  it("finds no structured line in the captured failures", () => {
+    // The decoder is forward-compatible: agy reports both captured failures (an invalid model, an
+    // outage) through a plain `error:` line plus a failed result, never through AGY_ERROR.
+    for (const name of ["05-error.stderr", "05-unavailable.stderr"]) {
+      const lines = readFileSync(join(fixturesDir, name), "utf8").split("\n");
+      expect(lines.filter((line) => parseAgyErrorLine(line) !== null)).toEqual([]);
+    }
+  });
+});
+
 describe("captured agy fixtures", () => {
   it("has fixtures on disk to exercise the decoder", () => {
     expect(fixtureNames().length).toBeGreaterThan(0);
@@ -79,10 +132,14 @@ describe("captured agy fixtures", () => {
   it.each(fixtureNames())("%s decodes without loss and starts with init", (name) => {
     const events = loadFixture(name);
     expect(events.length).toBeGreaterThan(0);
-    expect(events[0]?.kind).toBe("init");
     expect(events.some((event) => event.kind === "unknown")).toBe(false);
 
     const first = events[0];
+    if (LAUNCH_FAILURE_FIXTURES.includes(name)) {
+      expect(first?.kind).toBe("result");
+      return;
+    }
+    expect(first?.kind).toBe("init");
     if (first?.kind === "init") {
       expect(first.conversationId).toMatch(/[0-9a-f-]{8,}/);
       expect(first.tools.length).toBeGreaterThan(0);

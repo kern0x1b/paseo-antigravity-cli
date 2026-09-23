@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import { promisify } from "node:util";
 import type {
   ProviderCatalog,
@@ -47,7 +48,28 @@ export const FALLBACK_MODELS: readonly ProviderModel[] = [
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MODELS_TIMEOUT_MS = 20_000;
 
-let cache: { at: number; models: readonly ProviderModel[] } | null = null;
+let cache: { key: string; at: number; models: readonly ProviderModel[] } | null = null;
+
+/**
+ * Identity of the CLI whose model list is cached. A different binary or a rebuilt one can report a
+ * different list, so both the resolved path and its modification time belong in the key that Paseo
+ * uses to decide whether to rediscover — and in the key this module caches under.
+ */
+export function catalogCacheKey(binary?: string): string {
+  const resolved = resolveAgyBinary(binary);
+  let mtime = "unknown";
+  try {
+    mtime = String(statSync(resolved).mtimeMs);
+  } catch {
+    // A PATH-resolved or deleted binary has no build identity; the path still keys the cache.
+  }
+  return `${resolved}|${mtime}|${process.env.PASEO_ANTIGRAVITY_BIN ?? ""}`;
+}
+
+/** Drops the discovered list so the next catalog request runs `agy models` again. */
+export function invalidateCatalogCache(): void {
+  cache = null;
+}
 
 /**
  * Synchronous view of the last discovered list, for `session.config` where an async lookup would
@@ -69,7 +91,8 @@ export async function buildCatalog(binary?: string): Promise<ProviderCatalog> {
 }
 
 async function loadModels(binary?: string): Promise<readonly ProviderModel[]> {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.models;
+  const key = catalogCacheKey(binary);
+  if (cache && cache.key === key && Date.now() - cache.at < CACHE_TTL_MS) return cache.models;
 
   let models: readonly ProviderModel[] = [];
   try {
@@ -83,7 +106,7 @@ async function loadModels(binary?: string): Promise<readonly ProviderModel[]> {
   }
 
   const resolved = models.length > 0 ? models : FALLBACK_MODELS;
-  cache = { at: Date.now(), models: resolved };
+  cache = { key, at: Date.now(), models: resolved };
   return resolved;
 }
 

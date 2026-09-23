@@ -6,6 +6,7 @@ import {
   type ProviderConfigState,
   type ProviderConnection,
   type ProviderContent,
+  type ProviderError,
   type ProviderEvent,
   type ProviderInput,
   type ProviderPersistence,
@@ -17,30 +18,51 @@ import {
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import { AgyProcess } from "./agy";
+import { readToolPermission } from "./agysettings";
+import {
+  isObservedTool,
+  isSnapshotTool,
+  readSnapshot,
+  snapshotTarget,
+  type FileSnapshot,
+} from "./edits";
 import {
   DEFAULT_MODE_ID,
   MODES,
   buildCatalog,
+  catalogCacheKey,
   currentModels,
+  invalidateCatalogCache,
 } from "./catalog";
 import {
   STEP_AGENT_RESPONSE,
   STEP_STATE_DONE,
   STEP_TOOL,
   isInterrupted,
+  parseAgyErrorLine,
+  type AgyErrorReport,
   type AgyEvent,
   type AgyResult,
   type AgyStepUpdate,
-  type AgyToolInfo,
   type AgyUsage,
 } from "./protocol";
 import { TranscriptStore } from "./transcript";
+import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 const PROVIDER_ID = "antigravity-cli";
 const STDERR_TAIL = 20;
-const SUMMARY_VALUE_LENGTH = 80;
+/** Whole files remembered per session for diffing, newest last. */
+const OBSERVED_LIMIT = 32;
+
+/**
+ * A transient Antigravity outage. Captured verbatim from a real one as
+ * `UNAVAILABLE (code 503): The service is currently unavailable.` in the failed result's `error`
+ * (fixtures/05-unavailable.ndjson). The check is deliberately narrow: widening it would label a
+ * permanent failure such as `model does-not-exist is not recognized` as worth retrying.
+ */
+const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
 
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
@@ -66,6 +88,14 @@ export function createProvider(): ProviderRegistration {
     label: "Antigravity",
     description: "Run, monitor, and steer Antigravity sessions from Paseo",
     icon: "icon.svg",
+    async getCatalogCacheKey(options) {
+      // Catalog inputs carry no providerOptions, so a per-session `agyPath` cannot reach the
+      // catalog; the key follows the resolved binary, its build, and the environment override.
+      // `force` is the caller asking for a refresh, which the in-process cache must not answer
+      // with the list it already has.
+      if (options.force) invalidateCatalogCache();
+      return catalogCacheKey();
+    },
     async connect(request) {
       if (!request.versions.includes(1)) {
         throw new Error("Antigravity provider requires provider protocol version 1");
@@ -83,6 +113,8 @@ interface Session {
   settings: Record<string, JsonValue>;
   selection: { model?: string; mode?: string };
   conversationId: string | null;
+  /** `persist: false` keeps the conversation resumable but writes no timeline to disk. */
+  readonly persist: boolean;
   transcript: TranscriptStore | null;
   /** Rows published before `init` supplied a conversation id, drained into the store on init. */
   unpersisted: ProviderTimelineItem[];
@@ -91,13 +123,56 @@ interface Session {
   needsRestart: boolean;
   systemPromptSent: boolean;
   turnCounter: number;
-  currentTurnId: string | null;
-  pendingTurns: string[];
-  assistant: Map<number, string>;
-  turnHadAssistantText: boolean;
+  /** Turns written to agy that have not reported a result yet, oldest first. */
+  pendingTurns: PendingTurn[];
+  /**
+   * The content of files the plugin has been shown, newest last. agy applies an edit *before* it
+   * reports the step as ACTIVE (probed: the rewritten file is on disk when the ACTIVE line
+   * arrives), so the step's own snapshot is already the state after the edit; what the plugin saw
+   * earlier is then the only usable "before".
+   */
+  observed: Map<string, Promise<FileSnapshot | null>>;
   stderrTail: string[];
+  /** Structured `AGY_ERROR` line of the current process, if it printed one. */
+  agyError: AgyErrorReport | null;
   interrupting: boolean;
   closing: boolean;
+}
+
+/**
+ * agy runs queued stdin lines in order, so the *oldest* pending turn owns every incoming event:
+ * a prompt sent while another turn is streaming must not relabel that turn's rows or clear the
+ * text it has already accumulated.
+ */
+interface PendingTurn {
+  readonly turnId: string;
+  /** Incremental assistant text per step_index, accumulated into complete snapshots. */
+  readonly assistant: Map<number, string>;
+  /** Tool rows published as `running` and not yet complete, keyed by call id. */
+  readonly tools: Map<string, OpenToolCall>;
+  /** The target file as it was when a snapshot tool started, keyed by call id. */
+  readonly snapshots: Map<string, Promise<FileSnapshot | null>>;
+  hadAssistantText: boolean;
+  /**
+   * `input_tokens` of the last agent_response step that reported usage: the size the model's
+   * context had reached, as opposed to the result's total across every step of the turn.
+   */
+  contextInputTokens?: number;
+}
+
+/** The fields of a tool row, kept so a call left open can be republished with a terminal status. */
+interface OpenToolCall {
+  readonly id: string;
+  readonly callId: string;
+  readonly name: string;
+  readonly detail: ProviderToolCallDetail;
+  readonly metadata: Record<string, JsonValue>;
+}
+
+/** The error a failed turn reports, and whether retrying is likely to help. */
+interface TurnFailure {
+  error: ProviderError;
+  retryable: boolean;
 }
 
 interface ConnectionState {
@@ -134,13 +209,18 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
       if (closed) return;
       closed = true;
       const running: AgyProcess[] = [];
+      const flushing: Promise<void>[] = [];
       for (const session of state.sessions.values()) {
         session.closing = true;
         if (session.process) running.push(session.process);
         session.process = null;
+        if (session.transcript) flushing.push(session.transcript.flush());
       }
       state.sessions.clear();
       listeners.clear();
+      // The rows of the last turn are still inside the debounce window, so flushing before the
+      // processes are disposed is what lets a reload replay the answer that just finished.
+      await Promise.all(flushing);
       await Promise.all(running.map((process) => process.dispose()));
     },
   };
@@ -197,6 +277,7 @@ async function openSession(
   const config = input.config;
   const conversationId = readConversationId(input.persistence);
   const options = readProviderOptions(config);
+  const persist = config.persist !== false;
 
   const session: Session = {
     sessionId: input.sessionId,
@@ -209,17 +290,18 @@ async function openSession(
       mode: config.mode ?? DEFAULT_MODE_ID,
     },
     conversationId,
-    transcript: conversationId === null ? null : await TranscriptStore.load(conversationId),
+    persist,
+    transcript:
+      persist && conversationId !== null ? await TranscriptStore.load(conversationId) : null,
     unpersisted: [],
     process: null,
     needsRestart: false,
     systemPromptSent: conversationId !== null,
     turnCounter: 0,
-    currentTurnId: null,
     pendingTurns: [],
-    assistant: new Map(),
-    turnHadAssistantText: false,
+    observed: new Map(),
     stderrTail: [],
+    agyError: null,
     interrupting: false,
     closing: false,
   };
@@ -293,11 +375,17 @@ async function promptSession(
   }
 
   session.turnCounter += 1;
-  const turnId = `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`;
+  const turn: PendingTurn = {
+    turnId: `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`,
+    assistant: new Map(),
+    tools: new Map(),
+    snapshots: new Map(),
+    hadAssistantText: false,
+  };
 
   publish(session, emit, {
     type: "user_message",
-    id: `user:${turnId}`,
+    id: `user:${turn.turnId}`,
     text,
     clientMessageId: prompt.clientMessageId,
   });
@@ -305,26 +393,23 @@ async function promptSession(
     type: "session.prompt_result",
     sessionId: session.sessionId,
     clientMessageId: prompt.clientMessageId,
-    result: { type: "turn", turnId },
+    result: { type: "turn", turnId: turn.turnId },
   });
-  emit({ type: "session.turn", sessionId: session.sessionId, turnId, state: "started" });
-
-  session.pendingTurns.push(turnId);
-  session.currentTurnId = turnId;
-  session.turnHadAssistantText = false;
-  session.assistant.clear();
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
 
   try {
+    // Picking the process first: replacing a CLI whose stdin died settles the turns that CLI still
+    // owed, and this turn must not be counted among them.
     const process = ensureProcess(session, emit);
-    process.writeTurn(buildOutgoingText(session, text));
+    session.pendingTurns.push(turn);
+    await process.writeTurn(buildOutgoingText(session, text));
     session.systemPromptSent = true;
   } catch (error) {
-    session.pendingTurns = session.pendingTurns.filter((id) => id !== turnId);
-    session.currentTurnId = session.pendingTurns.at(-1) ?? null;
+    session.pendingTurns = session.pendingTurns.filter((pending) => pending !== turn);
     emit({
       type: "session.turn",
       sessionId: session.sessionId,
-      turnId,
+      turnId: turn.turnId,
       state: "failed",
       error: { message: describe(error), code: "agy_launch_failed" },
     });
@@ -412,7 +497,15 @@ async function closeSession(
 }
 
 function ensureProcess(session: Session, emit: Emit): AgyProcess {
-  if (session.process?.running) return session.process;
+  const current = session.process;
+  if (current?.running) {
+    if (current.acceptsInput) return current;
+    // A CLI that lost its stdin can neither take this turn nor finish the ones it still owes, so
+    // settle those turns and replace it. Its own exit is ignored below: it no longer owns the
+    // session, and failing the new process's turns from it would be wrong.
+    handleAgyExit(session, { code: null, signal: null }, emit);
+    void current.dispose();
+  }
 
   const process = new AgyProcess(
     {
@@ -421,22 +514,36 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
       model: session.selection.model,
       mode: session.selection.mode,
       conversationId: session.conversationId ?? undefined,
-      autoApprove: isAutoApprove(session),
+      skipPermissions: approvalPolicy(session) === "skip",
       extraArgs: session.extraArgs,
       binary: session.agyPath,
     },
     {
-      onEvent: (event) => handleAgyEvent(session, event, emit),
+      // A replaced CLI keeps writing events and stderr until it dies; none of it belongs to the
+      // turns of the process that replaced it.
+      onEvent: (event) => {
+        if (session.process !== process) return;
+        handleAgyEvent(session, event, emit);
+      },
       onStderr: (line) => {
+        if (session.process !== process) return;
         session.stderrTail.push(line);
         if (session.stderrTail.length > STDERR_TAIL) session.stderrTail.shift();
+        session.agyError = parseAgyErrorLine(line) ?? session.agyError;
         console.error(`[antigravity] ${line}`);
       },
-      onExit: (info) => handleAgyExit(session, info, emit),
+      onExit: (info) => {
+        if (session.process !== process) return;
+        handleAgyExit(session, info, emit);
+      },
     },
   );
 
   session.process = process;
+  // The tail explains *this* process's failure; leftovers from a previous launch would be quoted
+  // as if they came from the run that just died. The same holds for the structured error line.
+  session.stderrTail = [];
+  session.agyError = null;
   process.start();
   return process;
 }
@@ -450,7 +557,7 @@ function handleAgyEvent(session: Session, event: AgyEvent, emit: Emit): void {
       if (event.conversationId !== session.conversationId) {
         session.conversationId = event.conversationId;
         // A new conversation starts empty; a resumed one was loaded during session.open.
-        session.transcript = new TranscriptStore(event.conversationId);
+        session.transcript = session.persist ? new TranscriptStore(event.conversationId) : null;
       }
       if (session.transcript && session.unpersisted.length > 0) {
         // The user's first message is published before the process exists, so it is captured here.
@@ -481,20 +588,29 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
       `${step.tool_name ? ` tool=${step.tool_name}` : ""}`,
   );
 
+  const turn = session.pendingTurns[0];
+
   if (step.step_type === STEP_AGENT_RESPONSE) {
+    if (!turn) {
+      console.error(
+        `[antigravity] dropping an agent_response step that belongs to no pending turn (idx=${step.step_index})`,
+      );
+      return;
+    }
     if (step.text_delta) {
       // text_delta is an incremental chunk, so accumulate to republish complete snapshots.
-      session.assistant.set(
+      turn.assistant.set(
         step.step_index,
-        (session.assistant.get(step.step_index) ?? "") + step.text_delta,
+        (turn.assistant.get(step.step_index) ?? "") + step.text_delta,
       );
     }
-    const text = session.assistant.get(step.step_index);
+    if (step.usage?.input_tokens !== undefined) turn.contextInputTokens = step.usage.input_tokens;
+    const text = turn.assistant.get(step.step_index);
     if (text && text.length > 0) {
-      session.turnHadAssistantText = true;
+      turn.hadAssistantText = true;
       publish(session, emit, {
         type: "assistant_message",
-        id: itemId(session, step.step_index, "msg"),
+        id: itemId(turn, step.step_index, "msg"),
         text,
       });
     }
@@ -502,27 +618,54 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
   }
 
   if (step.step_type === STEP_TOOL) {
-    const callId = itemId(session, step.step_index, "tool");
+    if (!turn) {
+      console.error(
+        `[antigravity] dropping a tool step that belongs to no pending turn (idx=${step.step_index})`,
+      );
+      return;
+    }
+    const callId = itemId(turn, step.step_index, "tool");
     const name = step.tool_name ?? step.tool_info?.name ?? "tool";
     console.log(`[antigravity] tool ${name} ${step.state}`);
-    const base = {
-      type: "tool_call" as const,
+    const detail = mapToolDetail(name, step.tool_info, session.config.cwd);
+    const tool: OpenToolCall = {
       id: callId,
       callId,
       name,
-      detail: mapToolDetail(name, step.tool_info, session.config.cwd),
+      detail,
       metadata: {
         stepIndex: step.step_index,
         ...(step.tool_info?.parameters ? { parameters: toJson(step.tool_info.parameters) } : {}),
       },
     };
-    publish(
-      session,
-      emit,
-      step.state === STEP_STATE_DONE
-        ? { ...base, status: "completed", error: null }
-        : { ...base, status: "running", error: null },
-    );
+    // The stream names the file but not the change, so the file itself is the only source for a
+    // diff: snapshot it before the call runs and compare once the call reports DONE. Parameters
+    // that already carry the content win, and a file that cannot be read leaves the row as is.
+    const parameters = step.tool_info?.parameters;
+    const snapshotPath = snapshotTarget(parameters);
+    // A read tool is the one chance to see the file as it was before a later edit changes it, and
+    // only as the step *arrives*: re-reading when the step finishes would race whatever changed
+    // the file in between and store the result as if the step had shown it.
+    if (
+      snapshotPath &&
+      isObservedTool(name) &&
+      (step.state !== STEP_STATE_DONE || !session.observed.has(snapshotPath))
+    ) {
+      rememberObserved(session, snapshotPath);
+    }
+    const target = isSnapshotTool(name) && !hasEditContent(detail) ? snapshotPath : null;
+
+    if (step.state === STEP_STATE_DONE) {
+      turn.tools.delete(callId);
+      const before = turn.snapshots.get(callId);
+      turn.snapshots.delete(callId);
+      publish(session, emit, { type: "tool_call", ...tool, status: "completed", error: null });
+      if (target && before) void publishEditDiff(session, emit, tool, target, before);
+      return;
+    }
+    turn.tools.set(callId, tool);
+    if (target) turn.snapshots.set(callId, readSnapshot(target));
+    publish(session, emit, { type: "tool_call", ...tool, status: "running", error: null });
     return;
   }
 
@@ -531,24 +674,29 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
 }
 
 function handleResult(session: Session, result: AgyResult, emit: Emit): void {
-  const turnId = session.pendingTurns.shift() ?? null;
-  session.currentTurnId = session.pendingTurns.at(-1) ?? null;
+  const turn = session.pendingTurns.shift() ?? null;
   console.log(
     `[antigravity] result status=${result.status} turns=${result.num_turns ?? "-"} text=${
       (result.response ?? "").length
     } chars${result.error ? ` error=${result.error}` : ""}`,
   );
 
-  if (result.usage) {
+  // `result.usage.input_tokens` totals every step of the turn, so on its own it overstates what
+  // the model is holding; the last step's own count is the context occupancy.
+  const contextWindowUsedTokens = turn?.contextInputTokens;
+  if (result.usage || contextWindowUsedTokens !== undefined) {
     emit({
       type: "session.usage",
       sessionId: session.sessionId,
-      turnId: turnId ?? undefined,
-      usage: toProviderUsage(result.usage),
+      turnId: turn?.turnId,
+      usage: {
+        ...(result.usage ? toProviderUsage(result.usage) : {}),
+        ...(contextWindowUsedTokens !== undefined ? { contextWindowUsedTokens } : {}),
+      },
     });
   }
 
-  if (turnId === null) {
+  if (turn === null) {
     console.error(`[antigravity] ignoring a result with no active turn (${result.status})`);
     return;
   }
@@ -556,38 +704,42 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
   if (result.status === "SUCCESS") {
     const response = result.response ?? "";
     // Safety net: agy answered without streaming any assistant text.
-    if (!session.turnHadAssistantText && response.trim().length > 0) {
+    if (!turn.hadAssistantText && response.trim().length > 0) {
       publish(session, emit, {
         type: "assistant_message",
-        id: `agy:result:${turnId}`,
+        id: `agy:result:${turn.turnId}`,
         text: response,
       });
     }
-    emit({ type: "session.turn", sessionId: session.sessionId, turnId, state: "completed" });
+    emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
     return;
   }
 
   if (isInterrupted(result)) {
+    finalizeToolCalls(session, emit, turn, { status: "canceled" });
     emit({
       type: "session.turn",
       sessionId: session.sessionId,
-      turnId,
+      turnId: turn.turnId,
       state: "canceled",
       error: { message: "Interrupted" },
     });
     return;
   }
 
+  const { error, retryable } = turnFailure(session, {
+    message: result.error ?? `Antigravity reported ${result.status}`,
+    code: result.status,
+  });
+  finalizeToolCalls(session, emit, turn, { status: "failed", error });
   emit({
     type: "session.turn",
     sessionId: session.sessionId,
-    turnId,
+    turnId: turn.turnId,
     state: "failed",
-    error: {
-      message: result.error ?? `Antigravity reported ${result.status}`,
-      code: result.status,
-    },
+    error,
   });
+  if (retryable) emitUnavailableNotice(session, emit);
 }
 
 function handleAgyExit(
@@ -600,7 +752,6 @@ function handleAgyExit(
 
   const pending = session.pendingTurns;
   session.pendingTurns = [];
-  session.currentTurnId = null;
   if (pending.length === 0) return;
 
   // agy writes its diagnostics to stderr, which is where an invalid model or a missing sign-in
@@ -610,21 +761,148 @@ function handleAgyExit(
     tail.length > 0
       ? tail
       : `Antigravity exited (code ${info.code ?? "none"}${info.signal ? `, signal ${info.signal}` : ""})`;
+  // A canceled turn is not an API failure, so the structured error line of the process that
+  // happened to be signalled must not be reported as its cause.
+  const failure: TurnFailure = session.interrupting
+    ? { error: { message: detail, code: "interrupted" }, retryable: false }
+    : turnFailure(session, { message: detail, code: "agy_exit" });
 
-  for (const turnId of pending) {
+  for (const turn of pending) {
+    finalizeToolCalls(
+      session,
+      emit,
+      turn,
+      session.interrupting ? { status: "canceled" } : { status: "failed", error: failure.error },
+    );
     emit({
       type: "session.turn",
       sessionId: session.sessionId,
-      turnId,
+      turnId: turn.turnId,
       state: session.interrupting ? "canceled" : "failed",
-      error: { message: detail, code: session.interrupting ? "interrupted" : "agy_exit" },
+      error: failure.error,
     });
+  }
+  if (failure.retryable) emitUnavailableNotice(session, emit);
+}
+
+/**
+ * The error a failed turn reports. A structured `AGY_ERROR` line is canonical when the process
+ * printed one; otherwise a transient outage is named `unavailable` so a retry is obvious, and any
+ * other failure keeps the status agy reported or the exit-path code.
+ */
+function turnFailure(session: Session, fallback: { message: string; code: string }): TurnFailure {
+  const report = session.agyError;
+  if (report) {
+    const error: ProviderError = {
+      message: report.short_error ?? fallback.message,
+      code: report.status ?? fallback.code,
+      diagnostic: report.raw,
+    };
+    const retryable =
+      report.retryable === true || UNAVAILABLE_PATTERN.test(`${error.code ?? ""} ${error.message}`);
+    return { error, retryable };
+  }
+  if (UNAVAILABLE_PATTERN.test(fallback.message)) {
+    return { error: { message: fallback.message, code: "unavailable" }, retryable: true };
+  }
+  return { error: { message: fallback.message, code: fallback.code }, retryable: false };
+}
+
+function emitUnavailableNotice(session: Session, emit: Emit): void {
+  emitNotice(
+    session,
+    emit,
+    "agy-unavailable",
+    "warning",
+    "Antigravity is temporarily unavailable",
+    "The Antigravity service reported that it is temporarily unavailable. Retry the prompt in a moment; this usually clears on its own.",
+  );
+}
+
+/**
+ * A tool row published as `running` would otherwise stay running forever once its turn ends, so
+ * every call left open is republished with a terminal status under the same id.
+ */
+function finalizeToolCalls(
+  session: Session,
+  emit: Emit,
+  turn: PendingTurn,
+  terminal: { status: "canceled" } | { status: "failed"; error: ProviderError },
+): void {
+  if (turn.tools.size === 0) return;
+  for (const tool of turn.tools.values()) {
+    publish(
+      session,
+      emit,
+      terminal.status === "canceled"
+        ? { type: "tool_call", ...tool, status: "canceled", error: null }
+        : { type: "tool_call", ...tool, status: "failed", error: toErrorJson(terminal.error) },
+    );
+  }
+  turn.tools.clear();
+}
+
+/**
+ * Keeps the newest content the plugin was shown for a path, bounded so a long session cannot
+ * accumulate whole files. A caller that already holds the content passes it rather than paying
+ * for a second read.
+ */
+function rememberObserved(session: Session, path: string, snapshot?: FileSnapshot): void {
+  session.observed.delete(path);
+  session.observed.set(path, snapshot ? Promise.resolve(snapshot) : readSnapshot(path));
+  if (session.observed.size > OBSERVED_LIMIT) {
+    const oldest = session.observed.keys().next().value;
+    if (oldest !== undefined) session.observed.delete(oldest);
+  }
+}
+
+/**
+ * Republishes a completed tool row with a diff once both snapshots of its target are in hand.
+ * Nothing waits on it: the row the stream justified is already on screen, and Paseo replaces a
+ * row by id, so a slow read can neither delay the turn nor reorder the rows after it.
+ */
+async function publishEditDiff(
+  session: Session,
+  emit: Emit,
+  tool: OpenToolCall,
+  path: string,
+  before: Promise<FileSnapshot | null>,
+): Promise<void> {
+  try {
+    const [active, current] = await Promise.all([before, readSnapshot(path)]);
+    if (current === null || !current.exists) return;
+    // The step's own snapshot is the "before" whenever the file still held its previous content
+    // when the step arrived. When it already matches, the edit had applied before ACTIVE reached
+    // the plugin, and the last content the plugin was shown is what changed.
+    const observed = (await session.observed.get(path)) ?? null;
+    const previous = active !== null && active.text !== current.text ? active : (observed ?? active);
+    if (previous === null) return;
+    if (previous.exists && previous.text === current.text) return;
+    if (session.closing) return;
+
+    // write_to_file creating a file has no earlier state to diff against, so the row shows what
+    // the file now holds. Anything else is described as the edit it was.
+    let detail: ProviderToolCallDetail;
+    if (!previous.exists && tool.name === "write_to_file") {
+      detail = { type: "write", filePath: path, content: current.text };
+    } else {
+      const unifiedDiff = snapshotDiff(path, previous.text, current.text, session.config.cwd);
+      if (unifiedDiff === null) return;
+      detail = { type: "edit", filePath: path, unifiedDiff };
+    }
+
+    publish(session, emit, { type: "tool_call", ...tool, detail, status: "completed", error: null });
+    rememberObserved(session, path, current);
+  } catch (error) {
+    console.error(
+      `[antigravity] could not diff ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
 function publish(session: Session, emit: Emit, item: ProviderTimelineItem): void {
   if (session.transcript) session.transcript.upsert(item);
-  else session.unpersisted.push(item);
+  else if (session.persist) session.unpersisted.push(item);
   emit({ type: "timeline.item", sessionId: session.sessionId, item });
 }
 
@@ -655,20 +933,37 @@ function configState(session: Session): ProviderConfigState {
 }
 
 function buildSettings(session: Session): readonly ProviderSetting[] {
+  const policy = approvalPolicy(session);
+  // Antigravity decides through its own setting unless the user overrides it here, so the row
+  // names that value rather than guessing at what a headless run will do.
+  const permission = readToolPermission() ?? "unknown";
   return [
     {
-      type: "toggle",
-      id: "autoApprove",
-      label: "Auto-approve tools",
+      type: "select",
+      id: "approvalPolicy",
+      label: "Tool approval",
       description:
-        "Passes --dangerously-skip-permissions. Without it, Antigravity denies tools that need approval in headless runs.",
-      value: isAutoApprove(session),
+        policy === "skip"
+          ? `Every tool runs without asking (--dangerously-skip-permissions), overriding Antigravity's toolPermission (${permission}).`
+          : `Antigravity decides, using its own toolPermission setting (${permission}).`,
+      value: policy,
+      options: [
+        { label: "Use Antigravity setting", value: "agy" },
+        { label: "Skip all permissions", value: "skip" },
+      ],
     },
   ];
 }
 
-function isAutoApprove(session: Session): boolean {
-  return session.settings.autoApprove !== false;
+/**
+ * `agy` defers approval to Antigravity's own `toolPermission` setting and passes no flag; `skip`
+ * passes --dangerously-skip-permissions. A session persisted before this select existed carries
+ * the removed `autoApprove` toggle, which was on by default and meant the same as `skip`.
+ */
+function approvalPolicy(session: Session): "agy" | "skip" {
+  const value = session.settings.approvalPolicy;
+  if (value === "agy" || value === "skip") return value;
+  return session.settings.autoApprove === true ? "skip" : "agy";
 }
 
 function requireSession(state: ConnectionState, sessionId: string): Session {
@@ -677,8 +972,16 @@ function requireSession(state: ConnectionState, sessionId: string): Session {
   return session;
 }
 
-function itemId(session: Session, stepIndex: number, kind: string): string {
-  return `agy:${kind}:${session.currentTurnId ?? "idle"}:${stepIndex}`;
+function itemId(turn: PendingTurn, stepIndex: number, kind: string): string {
+  return `agy:${kind}:${turn.turnId}:${stepIndex}`;
+}
+
+function toErrorJson(error: ProviderError): JsonValue {
+  return {
+    message: error.message,
+    ...(error.code !== undefined ? { code: error.code } : {}),
+    ...(error.diagnostic !== undefined ? { diagnostic: error.diagnostic } : {}),
+  };
 }
 
 function persistenceFor(conversationId: string | null): ProviderPersistence {
@@ -751,97 +1054,6 @@ function renderReview(part: Extract<ProviderContent, { type: "review" }>): strin
     lines.push(`\n${comment.filePath}:${comment.lineNumber} (${comment.side})\n${comment.body}`);
   }
   return lines.join("\n");
-}
-
-function mapToolDetail(
-  name: string,
-  info: AgyToolInfo | undefined,
-  cwd: string,
-): ProviderToolCallDetail {
-  const parameters = info?.parameters ?? {};
-  const output = info?.output;
-  const text = (key: string): string | undefined => {
-    const value = parameters[key];
-    return typeof value === "string" && value.length > 0 ? value : undefined;
-  };
-  const plain = (): ProviderToolCallDetail => ({
-    type: "plain_text",
-    label: name,
-    text: output ?? summarizeParameters(parameters),
-  });
-
-  switch (name) {
-    case "run_command": {
-      const command = text("CommandLine");
-      return command
-        ? { type: "shell", command, cwd: text("Cwd") ?? cwd, output }
-        : plain();
-    }
-    case "view_file":
-    case "read_resource": {
-      const filePath = text("AbsolutePath") ?? text("Path");
-      return filePath ? { type: "read", filePath } : plain();
-    }
-    case "write_to_file": {
-      const filePath = text("TargetFile") ?? text("AbsolutePath");
-      return filePath
-        ? { type: "write", filePath, content: text("CodeContent") ?? text("Content") }
-        : plain();
-    }
-    case "replace_file_content":
-    case "multi_replace_file_content":
-    case "sed_file": {
-      const filePath = text("TargetFile") ?? text("AbsolutePath");
-      return filePath ? { type: "edit", filePath } : plain();
-    }
-    case "grep_search":
-      return {
-        type: "search",
-        query: text("Query") ?? text("Pattern") ?? "",
-        toolName: "grep",
-        content: output,
-      };
-    case "find_by_name":
-    case "list_dir":
-      return {
-        type: "search",
-        query: text("Pattern") ?? text("DirectoryPath") ?? "",
-        toolName: "glob",
-        content: output,
-      };
-    case "search_web":
-      return {
-        type: "search",
-        query: text("query") ?? text("Query") ?? "",
-        toolName: "web_search",
-        content: output,
-      };
-    case "read_url_content": {
-      const url = text("Url") ?? text("URL");
-      return url ? { type: "fetch", url, result: output } : plain();
-    }
-    case "invoke_subagent":
-    case "define_subagent":
-      return { type: "sub_agent", log: output ?? "", description: text("Description") };
-    default:
-      return plain();
-  }
-}
-
-function summarizeParameters(parameters: Record<string, unknown>): string {
-  const keys = Object.keys(parameters);
-  if (keys.length === 0) return "";
-  const parts = keys.slice(0, 4).map((key) => `${key}=${shorten(parameters[key])}`);
-  return keys.length > 4 ? `${parts.join(", ")}, …` : parts.join(", ");
-}
-
-function shorten(value: unknown): string {
-  const raw = typeof value === "string" ? value : JSON.stringify(value);
-  if (raw === undefined) return "undefined";
-  const single = raw.replace(/\s+/g, " ");
-  return single.length > SUMMARY_VALUE_LENGTH
-    ? `${single.slice(0, SUMMARY_VALUE_LENGTH)}…`
-    : single;
 }
 
 function toProviderUsage(usage: AgyUsage): ProviderUsage {

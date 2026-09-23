@@ -22,7 +22,8 @@ const usageSchema = z.object({
 });
 
 const initSchema = z.object({
-  conversation_id: z.string(),
+  // An empty id shows up on an eligibility failure and would name a transcript file ".jsonl".
+  conversation_id: z.string().min(1),
   init: z
     .object({
       cwd: z.string().optional(),
@@ -83,6 +84,53 @@ export const STEP_STATE_DONE = "DONE";
 
 /** agy reports an interrupted turn as a failed result carrying this exact error string. */
 export const INTERRUPTED_ERROR = "interrupted";
+
+/**
+ * The structured line agy 1.2.6+ documents as `AGY_ERROR: {...}` on stderr for a turn that ends on
+ * an agent or model API failure (its changelog ties that line to headless `-p`/`--prompt` mode and
+ * exit code 3). No capture in this repo produced one: a stream-json run with an invalid model, a
+ * failed sign-in, a dead proxy, a 503 and an oversized prompt all reported the failure through a
+ * plain `error:` line plus a failed result (fixtures/05-error.*, fixtures/05-unavailable.*).
+ * The decoder is therefore best-effort: every field is optional and `raw` keeps the JSON exactly
+ * as printed, so an unknown field still reaches `ProviderError.diagnostic` instead of being lost.
+ */
+export interface AgyErrorReport {
+  /** Canonical status, e.g. `UNAVAILABLE`. */
+  status?: string;
+  /** One-line human summary. */
+  short_error?: string;
+  retryable?: boolean;
+  raw: string;
+}
+
+const AGY_ERROR_PREFIX = "AGY_ERROR:";
+
+/** Parse one stderr line into an AGY_ERROR report, or null when the line is not one. */
+export function parseAgyErrorLine(line: string): AgyErrorReport | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(AGY_ERROR_PREFIX)) return null;
+
+  const raw = trimmed.slice(AGY_ERROR_PREFIX.length).trim();
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return null;
+
+  const record = decoded as Record<string, unknown>;
+  const text = (key: string): string | undefined =>
+    typeof record[key] === "string" && (record[key] as string).length > 0
+      ? (record[key] as string)
+      : undefined;
+  return {
+    status: text("status"),
+    short_error: text("short_error"),
+    ...(record.retryable === true ? { retryable: true } : {}),
+    raw,
+  };
+}
 
 /**
  * Parse one line of agy stdout. Returns null for blank lines, decorated output, and anything

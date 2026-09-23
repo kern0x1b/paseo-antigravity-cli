@@ -11,7 +11,8 @@ export interface AgyLaunchConfig {
   model?: string;
   mode?: string;
   conversationId?: string;
-  autoApprove: boolean;
+  /** Passes --dangerously-skip-permissions, so every tool runs without approval. */
+  skipPermissions: boolean;
   extraArgs?: readonly string[];
   binary?: string;
 }
@@ -55,7 +56,7 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
   // `default` is the implicit mode; agy only accepts accept-edits/plan.
   if (config.mode && config.mode !== "default") args.push("--mode", config.mode);
   if (config.conversationId) args.push("--conversation", config.conversationId);
-  if (config.autoApprove) args.push("--dangerously-skip-permissions");
+  if (config.skipPermissions) args.push("--dangerously-skip-permissions");
   if (config.extraArgs) args.push(...config.extraArgs);
   return args;
 }
@@ -79,6 +80,7 @@ export class AgyProcess {
     signal: null,
   };
   private processExited = false;
+  private stdinClosed = false;
   private readersPending = 0;
   private reported = false;
 
@@ -91,6 +93,16 @@ export class AgyProcess {
     return this.child !== null;
   }
 
+  /**
+   * Whether a turn can still be written. agy closes stdin when it gives up (it exits after every
+   * error result), and the pipe error may only surface on the next write, so `running` alone is not
+   * enough to decide that a process is still usable.
+   */
+  get acceptsInput(): boolean {
+    const stdin = this.child?.stdin;
+    return !!stdin && stdin.writable && !this.stdinClosed && !this.processExited;
+  }
+
   get binary(): string {
     return resolveAgyBinary(this.config.binary);
   }
@@ -100,6 +112,7 @@ export class AgyProcess {
     if (this.child) throw new Error("agy process is already running");
 
     this.processExited = false;
+    this.stdinClosed = false;
     this.readersPending = 0;
     this.reported = false;
     this.exitInfo = { code: null, signal: null };
@@ -145,6 +158,13 @@ export class AgyProcess {
       this.reportExitIfDrained();
     });
 
+    // agy exits after an error result, so the next turn can be written into a pipe whose reader is
+    // gone. Without a listener that EPIPE is an unhandled 'error' event and takes the plugin down.
+    child.stdin?.on("error", (error) => {
+      this.stdinClosed = true;
+      this.handlers.onStderr(`agy stdin closed: ${error.message}`);
+    });
+
     child.on("exit", (code, signal) => {
       this.exitInfo = { code, signal };
       this.processExited = true;
@@ -152,12 +172,25 @@ export class AgyProcess {
     });
   }
 
-  writeTurn(text: string): void {
-    const child = this.child;
-    if (!child || !child.stdin || !child.stdin.writable) {
-      throw new Error("agy process is not running");
+  /**
+   * Write one user turn. Rejects when the child's stdin is gone, so a turn aimed at a process that
+   * already gave up fails the turn instead of disappearing into the pipe.
+   */
+  async writeTurn(text: string): Promise<void> {
+    const stdin = this.child?.stdin;
+    if (!stdin || !this.acceptsInput) {
+      throw new Error("agy process is not running or its stdin is closed");
     }
-    child.stdin.write(encodeUserTurn(text));
+    const written = Promise.withResolvers<void>();
+    stdin.write(encodeUserTurn(text), (error) => {
+      if (error) {
+        this.stdinClosed = true;
+        written.reject(error);
+        return;
+      }
+      written.resolve();
+    });
+    await written.promise;
   }
 
   /** Interrupt the running turn. agy reports `result.error = "interrupted"` and exits. */
