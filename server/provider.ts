@@ -563,7 +563,7 @@ async function syncSessionMcp(session: Session, emit: Emit): Promise<void> {
     "mcp-shared",
     "warning",
     "Paseo tools are shared with Antigravity",
-    `Antigravity loads Paseo's MCP servers from ${result.path}. That file holds the credentials those servers use (HTTP headers, or environment variables for stdio servers), so keep it out of version control: add .agents/ to your .gitignore. The Paseo entries are removed when the last Paseo session in this folder closes.`,
+    `Antigravity loads Paseo's MCP servers from ${result.path}. That file holds the credentials those servers use (HTTP headers, or environment variables for stdio servers), so the plugin adds it to this repository's local git exclude — invisible to anyone else, and removed with the entries when the last Paseo session here closes. Outside a git work tree, keep .agents/mcp_config.json out of version control yourself.`,
   );
 }
 

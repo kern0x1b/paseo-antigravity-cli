@@ -11,14 +11,32 @@ already installed and signed in on your machine.
 
 ## Install
 
+From npm (Paseo 0.9):
+
 ```
-paseo plugin install <path-to-this-repo>
-paseo plugin reload antigravity-cli
-paseo plugin ls
+paseo plugin install npm:paseo-plugin-antigravity-cli
 ```
+
+Or from GitHub:
+
+```
+paseo plugin install github:lefos13/paseo-plugin-antigravity-cli
+```
+
+You can also paste either source into **Settings → Plugins → Plugin source**. Check it with
+`paseo plugin ls`; `antigravity-cli` should be `running`.
 
 Antigravity must already work on its own: `agy --version` should print, and `agy` should be signed
 in. Then pick **Antigravity** as the provider when you start a new agent.
+
+### How this differs from `agy-provider`
+
+[`agy-provider`](https://paseo.cafe/plugins/agy-provider) adapts Google's Antigravity ACP server
+through Paseo's ACP shim. This plugin drives the `agy` CLI directly over its documented
+`--input-format stream-json` / `--output-format stream-json` mode, so it needs no extra server
+install. On top of plain turns it adds edit diffs rebuilt from file snapshots, structured output
+through `--json-schema`, image input, import of existing agy conversations, slash commands and
+skills, and opt-in sharing of Paseo's MCP tools.
 
 ### Which `agy` gets launched
 
@@ -137,8 +155,17 @@ Antigravity** on, the plugin writes Paseo's `mcpServers` into `<cwd>/.agents/mcp
 
 - Off by default. Nothing is written until you turn it on.
 - Those entries hold whatever credentials the servers use (HTTP headers, or environment variables
-  for stdio servers), so **add `.agents/` to your `.gitignore`** — a notice naming the file is
-  shown whenever it is written.
+  for stdio servers). When the session's workspace is inside a git work tree the plugin adds the
+  file's path, relative to the repository root, to that repository's own `info/exclude` (the local
+  one under `.git`, which linked worktrees share). That file is never committed and is not shared
+  with anyone else, and `git add .` treats its lines exactly like `.gitignore` lines — so the
+  config, and the token in it, cannot be committed by accident. Nothing else is written there: the
+  plugin never edits `.gitignore`, and it removes its two lines again when the last Paseo session
+  in that workspace closes. A notice naming the file is shown whenever it is written.
+- Outside a git work tree, or when `git` is not installed, nothing is excluded: sharing still
+  works, but keep `.agents/mcp_config.json` out of your commits yourself (a `.git/info/exclude`
+  line in whichever repository holds the workspace, an entry in a global `core.excludesFile`, or
+  `.gitignore` if you accept committing that entry).
 - Ownership is tracked in a ledger; on the last `session.close` for that directory the plugin
   removes only its own entries, leaves every other entry untouched, and deletes the file only if
   the plugin created it. Entries left behind by a crash are cleaned up on the next `session.open`
@@ -157,9 +184,11 @@ Under `$PASEO_HOME` (default `~/.paseo`), in `plugin-data/antigravity-cli/`:
 | `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload. Newest snapshot per row id, capped at 500 rows, flushed on close. Not written when the session has `persist: false`. |
 | `attachments/<sessionId>/<n>.<ext>` | Images decoded from prompts. Deleted on `session.close`. |
 | `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with. Deleted on `session.close`. |
-| `mcp-ledger.json` | Which `paseo-*` entries the plugin wrote, in which workspace, for which sessions. |
+| `mcp-ledger.json` | Which `paseo-*` entries the plugin wrote, in which workspace, for which sessions, and the `info/exclude` lines it added there. |
 
-Plus, only while sharing is on, `<cwd>/.agents/mcp_config.json` in the session's workspace.
+Plus, only while sharing is on, `<cwd>/.agents/mcp_config.json` in the session's workspace — and,
+when that workspace is inside a git work tree, the two lines in that repository's local
+`info/exclude` that keep the file out of its commits.
 
 The plugin reads two things outside those directories: the `toolPermission` value in
 `~/.gemini/antigravity-cli/settings.json` (so the approval select can name it) and the

@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -158,5 +168,162 @@ describe("workspace MCP config", () => {
     });
     await releaseMcpServers("live");
     expect(existsSync(configPath)).toBe(false);
+  });
+});
+
+/**
+ * The config file holds Paseo's bearer token, so git must never offer it for a commit. A clone's
+ * own `info/exclude` is the one ignore file a plugin may write: it is not tracked, so nothing the
+ * user shares changes, and it takes effect for `git add .` exactly like `.gitignore` does.
+ */
+describe("keeping the config out of the user's commits", () => {
+  /** A real repository: the assertions below are git's own answers, not a re-implementation. */
+  function initRepo(name: string): string {
+    const repo = join(root, name);
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["init", "-q", repo]);
+    return repo;
+  }
+
+  function git(repo: string, ...args: string[]): string {
+    return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  }
+
+  /**
+   * The exclude file git reads, in the common git dir that linked worktrees share. git resolves
+   * the paths it prints, so the expected path is the real one (`/var` and `/private/var` differ).
+   */
+  function excludeFile(repo: string): string {
+    return join(realpathSync(repo), ".git", "info", "exclude");
+  }
+
+  function excludeLines(repo: string): string[] {
+    const path = excludeFile(repo);
+    return existsSync(path) ? readFileSync(path, "utf8").split("\n") : [];
+  }
+
+  it("hides the config from git status in the repository around it", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "workspace");
+    mkdirSync(work, { recursive: true });
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+
+    // This file carries `Authorization: Bearer T`, and one `git add .` used to commit it: status
+    // must not offer it at all.
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    expect(excludeLines(repo)).toEqual(
+      expect.arrayContaining([
+        "# added by paseo antigravity-cli plugin: /workspace/.agents/mcp_config.json",
+        "/workspace/.agents/mcp_config.json",
+      ]),
+    );
+    // Only git's own local exclude file is written; nothing the repository tracks is touched.
+    expect(existsSync(join(repo, ".gitignore"))).toBe(false);
+    expect(JSON.parse(readFileSync(ledgerPath, "utf8")).workspaces[work].gitExclude).toEqual({
+      file: excludeFile(repo),
+      pattern: "/workspace/.agents/mcp_config.json",
+    });
+  });
+
+  it("writes the pattern relative to the repository root for a nested workspace", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "src", "deep");
+    mkdirSync(work, { recursive: true });
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    expect(excludeLines(repo)).toContain("/src/deep/.agents/mcp_config.json");
+  });
+
+  it("excludes in the common git dir when the workspace is a linked worktree", async () => {
+    const repo = initRepo("repo");
+    writeFileSync(join(repo, "README.md"), "x\n", "utf8");
+    git(repo, "add", "-A");
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init");
+    const tree = join(root, "tree");
+    git(repo, "worktree", "add", "-q", "-b", "linked", tree);
+
+    await injectMcpServers({ cwd: tree, sessionId: "s1", servers: SERVERS });
+
+    // `git status` in the worktree is the proof that the common dir's file is the one git reads.
+    expect(git(tree, "status", "--porcelain")).toBe("");
+    expect(excludeLines(repo)).toContain("/.agents/mcp_config.json");
+  });
+
+  it("leaves a workspace that is not a repository alone", async () => {
+    await injectMcpServers({ cwd, sessionId: "s1", servers: SERVERS });
+
+    // Sharing still works; there is simply no repository to exclude the file in.
+    expect(existsSync(configPath)).toBe(true);
+    expect(existsSync(join(cwd, ".gitignore"))).toBe(false);
+    expect(JSON.parse(readFileSync(ledgerPath, "utf8")).workspaces[cwd].gitExclude).toBeUndefined();
+  });
+
+  it("adds its exclude lines once, however many sessions inject", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "workspace");
+    mkdirSync(work, { recursive: true });
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+    await injectMcpServers({ cwd: work, sessionId: "s2", servers: SERVERS });
+
+    const pattern = "/workspace/.agents/mcp_config.json";
+    // Exactly the marker and the pattern, once each, in that order: the second session found both.
+    expect(excludeLines(repo).filter((line) => line.includes(pattern))).toEqual([
+      `# added by paseo antigravity-cli plugin: ${pattern}`,
+      pattern,
+    ]);
+  });
+
+  it("appends after a last line that has no newline of its own", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "workspace");
+    mkdirSync(work, { recursive: true });
+    const file = excludeFile(repo);
+    // git reads this file happily; appending to it naively would glue the two lines into one.
+    writeFileSync(file, "*.log", "utf8");
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+
+    expect(readFileSync(file, "utf8")).toBe(
+      "*.log\n# added by paseo antigravity-cli plugin: /workspace/.agents/mcp_config.json\n/workspace/.agents/mcp_config.json\n",
+    );
+    expect(git(repo, "status", "--porcelain")).toBe("");
+  });
+
+  it("takes its own exclude lines back on release and leaves the rest", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "workspace");
+    mkdirSync(work, { recursive: true });
+    const file = excludeFile(repo);
+    const mine = "# the user's own notes\n*.log\n";
+    writeFileSync(file, mine, "utf8");
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+    expect(readFileSync(file, "utf8")).not.toBe(mine);
+
+    await releaseMcpServers("s1");
+
+    expect(readFileSync(file, "utf8")).toBe(mine);
+  });
+
+  it("keeps an exclude line the user wrote themselves", async () => {
+    const repo = initRepo("repo");
+    const work = join(repo, "workspace");
+    mkdirSync(work, { recursive: true });
+    const file = excludeFile(repo);
+    const theirs = "/workspace/.agents/mcp_config.json\n";
+    writeFileSync(file, theirs, "utf8");
+
+    await injectMcpServers({ cwd: work, sessionId: "s1", servers: SERVERS });
+
+    // Already excluded by a line that is not the plugin's, so nothing is added and nothing claimed.
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    expect(readFileSync(file, "utf8")).toBe(theirs);
+
+    await releaseMcpServers("s1");
+    expect(readFileSync(file, "utf8")).toBe(theirs);
   });
 });

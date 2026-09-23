@@ -733,7 +733,6 @@ describe("Paseo MCP sharing", () => {
     if (notice?.type === "session.notice") {
       // The file holds credentials and is inside the user's repository.
       expect(notice.notice.description).toContain(configPath());
-      expect(notice.notice.description).toContain(".gitignore");
       expect(notice.notice.description).not.toContain("secret");
     }
     expect(notices(events, "mcp-unsupported")).toEqual([]);
@@ -2257,6 +2256,10 @@ describe("slash commands", () => {
     expect(refusal).toMatchObject({
       result: { type: "failed", error: { code: "busy", message: expect.stringContaining("skill's own directory") } },
     });
+    await waitFor(
+      () => (readPrompts().length > 0 ? true : undefined),
+      "the running turn's prompt to reach the CLI",
+    );
     expect(readPrompts()).toEqual(["long task"]);
 
     await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });

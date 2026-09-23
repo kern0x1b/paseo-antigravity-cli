@@ -1,5 +1,6 @@
-import { mkdir, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { pluginDataDir } from "./plugindata";
 
@@ -76,6 +77,17 @@ export type InjectionResult =
 const configFileSchema = z.record(z.string(), z.unknown());
 const serverMapSchema = z.record(z.string(), z.unknown());
 
+/**
+ * The two lines the plugin appends to a repository's `info/exclude`, remembered so a release can
+ * take exactly those back and nothing else.
+ */
+const gitExcludeSchema = z.object({
+  /** Absolute path to the repository's `info/exclude`, in the git dir its worktrees share. */
+  file: z.string(),
+  /** The repository-relative pattern, e.g. `/.agents/mcp_config.json`. */
+  pattern: z.string(),
+});
+
 const ledgerSchema = z.object({
   version: z.literal(1),
   workspaces: z.record(
@@ -91,6 +103,12 @@ const ledgerSchema = z.object({
       createdDir: z.boolean().default(false),
       /** Entry name to the sessions that contributed it, so the last one out removes it. */
       entries: z.record(z.string(), z.array(z.string())),
+      /**
+       * The `info/exclude` lines the plugin added to keep this file out of the user's commits, if
+       * it added any. Missing in a ledger written before this field existed, which reads as
+       * "nothing was excluded".
+       */
+      gitExclude: gitExcludeSchema.optional(),
     }),
   ),
 });
@@ -140,21 +158,35 @@ export async function injectMcpServers(options: {
     const root = current.kind === "parsed" ? current.root : {};
     const servers = serverMapSchema.safeParse(root.mcpServers).data ?? {};
     const text = `${JSON.stringify({ ...root, mcpServers: { ...servers, ...named } }, null, 2)}\n`;
-    if (current.kind === "parsed" && current.raw === text) {
-      return { status: "unchanged", path, entries } as const;
+    const unchanged = current.kind === "parsed" && current.raw === text;
+    if (!unchanged) {
+      try {
+        await mkdir(dirname(path), { recursive: true });
+        // The entries carry whatever credentials Paseo's servers use (headers, env), so a file the
+        // plugin creates is private to the user.
+        await writeFile(path, text, { encoding: "utf8", mode: 0o600 });
+      } catch (error) {
+        const message = describe(error);
+        console.error(`[antigravity] could not write ${path}: ${message}`);
+        return { status: "failed", path, message } as const;
+      }
+      console.log(`[antigravity] wrote ${entries.length} MCP entr(ies) to ${path}`);
     }
-    try {
-      await mkdir(dirname(path), { recursive: true });
-      // The entries carry whatever credentials Paseo's servers use (headers, env), so a file the
-      // plugin creates is private to the user.
-      await writeFile(path, text, { encoding: "utf8", mode: 0o600 });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[antigravity] could not write ${path}: ${message}`);
-      return { status: "failed", path, message } as const;
+
+    // Those credentials must not reach a commit. This runs whenever the file holds the plugin's
+    // entries — written now, or found already written by a session in this directory — because the
+    // exclude line is the only thing standing between the token and the user's next `git add .`.
+    const excluded = await addGitExclude(options.cwd, path);
+    if (
+      excluded !== null &&
+      (workspace.gitExclude?.file !== excluded.file || workspace.gitExclude.pattern !== excluded.pattern)
+    ) {
+      workspace.gitExclude = excluded;
+      await writeLedger(ledger);
     }
-    console.log(`[antigravity] wrote ${entries.length} MCP entr(ies) to ${path}`);
-    return { status: "written", path, entries } as const;
+    return unchanged
+      ? ({ status: "unchanged", path, entries } as const)
+      : ({ status: "written", path, entries } as const);
   });
 }
 
@@ -221,8 +253,10 @@ async function removeEntries(cwd: string, names: readonly string[], ledger: Ledg
   }
   if (workspace && Object.keys(workspace.entries).length === 0) {
     delete ledger.workspaces[cwd];
-    // Nothing of this plugin's is left here. An `.agents` directory the plugin created itself is
-    // now empty again — unless the user keeps something else in it, which keeps the directory.
+    // Nothing of this plugin's is left here, so the exclude it added has nothing left to hide.
+    if (workspace.gitExclude) await removeGitExclude(workspace.gitExclude);
+    // An `.agents` directory the plugin created itself is now empty again — unless the user keeps
+    // something else in it, which keeps the directory.
     if (workspace.createdDir) await removeDirectoryIfEmpty(dirname(path));
   }
 }
@@ -243,6 +277,123 @@ async function directoryExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Opens a comment on a line of its own, and names the pattern it belongs to, so the plugin can
+ * recognise its own lines without guessing at the rest of the file. `info/exclude` has no comment
+ * syntax at the end of a line — `/.agents/mcp_config.json  # …` is one long pattern, which
+ * `git check-ignore` confirms by not matching the file — so a trailing marker would silently stop
+ * excluding anything.
+ */
+const EXCLUDE_MARKER = "# added by paseo antigravity-cli plugin";
+
+/** A hung or missing `git` must not hold up a session; excluding is best-effort housekeeping. */
+const GIT_TIMEOUT_MS = 5_000;
+
+type GitExclude = z.infer<typeof gitExcludeSchema>;
+
+/**
+ * Keeps the shared config — Paseo's own bearer token among its entries — out of the user's commits.
+ * A clone's `info/exclude` is the only ignore file a plugin may write: it is untracked, so nothing
+ * the user shares changes, while `git add .` treats it exactly like `.gitignore`. Appends twice
+ * never, once, and only when the pattern is not already there for some other reason.
+ */
+async function addGitExclude(cwd: string, path: string): Promise<GitExclude | null> {
+  const repo = await resolveRepo(cwd);
+  if (repo === null) return null;
+
+  // git prints paths it has already resolved, so the workspace side is resolved too before the
+  // two are compared: `/var/…` and `/private/var/…` are the same directory but not the same string.
+  const configDir = await realpath(dirname(path)).catch(() => dirname(path));
+  const rel = relative(repo.toplevel, join(configDir, "mcp_config.json"));
+  if (rel.length === 0 || rel.startsWith("..") || isAbsolute(rel)) {
+    console.log(`[antigravity] ${path} is outside the work tree at ${repo.toplevel}; it stays visible to git`);
+    return null;
+  }
+  const pattern = `/${rel.split(sep).join("/")}`;
+  const file = join(repo.commonDir, "info", "exclude");
+  const marker = `${EXCLUDE_MARKER}: ${pattern}`;
+  const raw = await readText(file);
+  const lines = raw === null ? [] : raw.split("\n");
+  if (lines.some((line) => line.trim() === marker)) return { file, pattern };
+  if (lines.some((line) => line.trim() === pattern)) {
+    // Someone else's line already covers it, so there is nothing to add and nothing to take back.
+    console.log(`[antigravity] ${pattern} is already excluded in ${file}; leaving that line alone`);
+    return null;
+  }
+  try {
+    await mkdir(dirname(file), { recursive: true });
+    // Appending to a file whose last line has no newline must not glue the two lines together.
+    const prefix = raw === null || raw.length === 0 || raw.endsWith("\n") ? (raw ?? "") : `${raw}\n`;
+    await writeFile(file, `${prefix}${marker}\n${pattern}\n`, "utf8");
+  } catch (error) {
+    console.error(`[antigravity] could not exclude ${pattern} in ${file}: ${describe(error)}`);
+    return null;
+  }
+  console.log(`[antigravity] excluded ${pattern} in ${file}`);
+  return { file, pattern };
+}
+
+/** Drops the marker and the pattern line under it, and leaves every other line where it is. */
+async function removeGitExclude(record: GitExclude): Promise<void> {
+  const raw = await readText(record.file);
+  if (raw === null) return;
+  const marker = `${EXCLUDE_MARKER}: ${record.pattern}`;
+  const lines = raw.split("\n");
+  const kept: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index]?.trim() !== marker) {
+      kept.push(lines[index] ?? "");
+      continue;
+    }
+    // The pattern is the plugin's only while it is still the line the marker introduces.
+    if (lines[index + 1]?.trim() === record.pattern) index += 1;
+  }
+  const text = kept.join("\n");
+  if (text === raw) return;
+  try {
+    await writeFile(record.file, text, "utf8");
+  } catch (error) {
+    console.error(`[antigravity] could not remove the exclude line in ${record.file}: ${describe(error)}`);
+  }
+}
+
+/**
+ * The repository a directory belongs to, in git's own terms: the root of its work tree, and the
+ * *common* git dir, which is the one that holds `info/exclude` for a linked worktree as well as for
+ * the main checkout (both `git worktree add` and a `.git` file point at it).
+ */
+async function resolveRepo(cwd: string): Promise<{ toplevel: string; commonDir: string } | null> {
+  let stdout: string;
+  try {
+    stdout = await runGit(cwd, ["rev-parse", "--show-toplevel", "--git-common-dir"]);
+  } catch (error) {
+    console.log(`[antigravity] no git work tree for ${cwd} (${describe(error)}); the MCP config stays visible to git`);
+    return null;
+  }
+  const [toplevel, common] = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (toplevel === undefined || common === undefined) return null;
+  // `--git-common-dir` comes back relative to the directory git ran in, which git resolved itself.
+  const realCwd = await realpath(cwd).catch(() => cwd);
+  return { toplevel, commonDir: resolve(realCwd, common) };
+}
+
+/** `git` bounded by a timeout, because a session's launch waits on this. */
+async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+  const { promise, resolve: settle, reject: fail } = Promise.withResolvers<string>();
+  execFile("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: GIT_TIMEOUT_MS }, (error, stdout) => {
+    if (error) fail(error);
+    else settle(stdout);
+  });
+  return promise;
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 type ConfigFile =
@@ -293,7 +444,7 @@ async function writeLedger(ledger: Ledger): Promise<void> {
     // No secrets here, only paths and ids; 0600 anyway, next to the files that do hold some.
     await writeFile(path, `${JSON.stringify(ledger, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   } catch (error) {
-    console.error(`[antigravity] could not write ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[antigravity] could not write ${path}: ${describe(error)}`);
   }
 }
 

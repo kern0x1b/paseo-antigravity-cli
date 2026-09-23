@@ -1,1 +1,1 @@
-Error: invalid --json-schema: failed to read schema file "/Users/eevangelinos/agy-schema-check-41429/does-not-exist.json": open /Users/eevangelinos/agy-schema-check-41429/does-not-exist.json: no such file or directory
+Error: invalid --json-schema: failed to read schema file "/Users/dev/agy-schema-check-41429/does-not-exist.json": open /Users/dev/agy-schema-check-41429/does-not-exist.json: no such file or directory

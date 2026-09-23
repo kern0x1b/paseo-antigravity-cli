@@ -1,13 +1,15 @@
 {
   "name": "paseo-plugin-antigravity-cli",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "files": [
     "README.md",
     "paseo-plugin.json",
     "icon.svg",
     "index.server.ts",
-    "server/"
+    "server/",
+    "!server/**/*.test.ts",
+    "!server/testing/",
+    "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -19,5 +21,24 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.6",
     "zod": "^4.4.3"
-  }
+  },
+  "description": "Antigravity CLI (agy) as a Paseo provider: streaming turns, tool rows with diffs, images, structured output, skills and slash commands, conversation import, and opt-in MCP sharing.",
+  "license": "MIT",
+  "author": "lefos13",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lefos13/paseo-plugin-antigravity-cli.git"
+  },
+  "homepage": "https://github.com/lefos13/paseo-plugin-antigravity-cli#readme",
+  "bugs": {
+    "url": "https://github.com/lefos13/paseo-plugin-antigravity-cli/issues"
+  },
+  "keywords": [
+    "paseo",
+    "paseo-plugin",
+    "antigravity",
+    "agy",
+    "gemini",
+    "provider"
+  ]
 }
