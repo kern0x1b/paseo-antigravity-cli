@@ -1,0 +1,7 @@
+{
+  "id": "antigravity-cli",
+  "description": "Run, monitor, and steer Antigravity sessions from Paseo",
+  "requirements": {
+    "paseo": ">=0.9.1"
+  }
+}
