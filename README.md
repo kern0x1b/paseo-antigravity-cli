@@ -109,12 +109,23 @@ The composer's command picker lists the commands this plugin has verified the CL
 
 | Command | Source |
 |---|---|
-| `/plan`, `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule` | The CLI's own workflows (`(system)` in the log). `/learn` writes the behaviour into the workspace's `GEMINI.md`; `/schedule` sets up a recurring run. |
+| `/plan`, `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser` | The CLI's own workflows (`(system)` in the log). `/learn` writes the behaviour into the workspace's `GEMINI.md`; `/schedule` sets up a recurring run; `/boost` runs the task with deep thinking, multiple perspectives and rigorous verification (it answers `Routine: Solo` when it keeps the work to itself); `/browser` hands the task to the CLI's browser agent. |
 | `/<name>` | A skill in this workspace's customization roots: `.agents/skills/<name>/SKILL.md`, and the same under `.agent/`, `_agents/`, `_agent/` (`(skill)` in the log). The name is the skill's own frontmatter `name`, not its directory. |
 | `/<name>` | A skill installed for every workspace, in the CLI's own precedence order: `~/.gemini/antigravity-cli/skills/<name>/SKILL.md`, `~/.gemini/config/skills/<name>/SKILL.md`, then `~/.gemini/skills/<name>/SKILL.md`. All three expand (`(skill)` in the log), and each one outranks the CLI's built-in skills. |
 | `<plugin>:<name>` | A skill of a plugin installed for the CLI, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin that keeps its one skill directly in `skills/` is addressed with a `..` placeholder — `/android-cli-plugin:..:android-cli` — because that is the name the CLI expands. |
 | `<name>` | A skill the CLI ships itself, under `~/.gemini/antigravity-cli/builtin/skills/`. |
 | `/<name>` | A skill in the shared installer's directory, `~/.agents/skills/<name>/SKILL.md`. The CLI never reads that directory, so the **plugin expands this one itself**: agy is sent the skill's own instructions as a plain message (never a slash name) and is given the skill's directory as an extra `--add-dir`, so the turn can read the scripts and templates the skill refers to. A name the CLI expands on its own, or a workspace skill, always wins over the copy here. |
+
+Antigravity decides some built-ins per account, not per binary: `/boost` and `/teamwork-preview`
+answer to the `boost_command_disabled` and `teamwork_preview_command_disabled` admin controls, and
+`/compact`, `/review` and `/owl` exist in the binary but stayed inert for the account these probes
+ran on (`enable-compact-slash-command`, `enable-review`, `enable-owl-slash-command`). A built-in
+that is disabled for your account simply **does not expand**: agy treats the text as an ordinary
+message and the model answers it, so choosing one of the commands above costs a normal turn rather
+than failing it. `/boost` and `/browser` expanded on every probe on the same account as the six
+before them, so they are listed; `/compact`, `/review` and `/owl` never expanded there, and a
+plugin cannot tell whether any other account has them, so they stay out rather than send a name
+that would silently be answered as text.
 
 Commands the CLI answers itself (`/skills`, `/usage`, `/quota`, `/credits`, `/model`, `/effort`,
 `/help`, `/config`, `/permissions`, `/hooks`, `/agents`, `/changelog`, …) are deliberately absent:
@@ -244,7 +255,7 @@ import), and, while a subagent runs, the transcript file agy names for it (read-
   continues from them.
 - **The command list is read from disk, not from the CLI.** `agy --print /skills --add-dir <dir>`
   does print the skill catalog, but it costs a CLI launch and does not carry the CLI's own workflows
-  (`/plan`, `/goal`, …), so the picker is filled by reading the same roots directly and the six
+  (`/plan`, `/goal`, …), so the picker is filled by reading the same roots directly and the eight
   workflows above are the ones probed by hand. A skill the CLI would refuse to load can therefore
   appear in the picker; choosing a command the CLI no longer expands sends `/<name>` as literal text
   and the model answers that text instead of running the workflow.

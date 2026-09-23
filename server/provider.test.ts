@@ -2102,6 +2102,8 @@ describe("slash commands", () => {
       { name: "teamwork-preview", description: expect.any(String) },
       { name: "learn", description: expect.any(String) },
       { name: "schedule", description: expect.any(String) },
+      { name: "boost", description: expect.any(String) },
+      { name: "browser", description: expect.any(String) },
       { name: "release-notes", description: "Draft the release notes" },
     ]);
     // Paseo fills the draft composer's picker only from what arrived before `session.ready`.

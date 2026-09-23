@@ -20,6 +20,13 @@ export interface AgyCommand {
  * Commands the CLI answers itself (`/skills`, `/usage`, `/model`, `/btw`, `/tasks`, …) are
  * deliberately absent: in print mode they fail the whole turn with `ERROR` and exit 2 instead of
  * being ignored, so sending one would kill the turn it was meant to start.
+ *
+ * Antigravity also ships built-ins it only enables for some accounts — `/compact`, `/review` and
+ * `/owl` are gated behind server-side flags (`enable-compact-slash-command`,
+ * `enable-owl-slash-command`, `enable-review`, and the `boost_command_disabled` /
+ * `teamwork_preview_command_disabled` admin controls). A disabled one never expands: agy treats
+ * the text as an ordinary message. Nothing can be probed into existence, so only the
+ * unconditional ones are listed here; see the Task 19 table for every name that was tried.
  */
 const SYSTEM_COMMANDS: readonly AgyCommand[] = [
   {
@@ -45,6 +52,16 @@ const SYSTEM_COMMANDS: readonly AgyCommand[] = [
   {
     name: "schedule",
     description: "Create a recurring, scheduled run of a task.",
+  },
+  {
+    name: "boost",
+    description:
+      "Approach the task with deep thinking, strategic planning, multiple perspectives, and rigorous verification.",
+  },
+  {
+    name: "browser",
+    description:
+      "Browse the web, search, and work with web applications, through Antigravity's browser agent.",
   },
 ];
 

@@ -45,16 +45,27 @@ async function names(): Promise<string[]> {
   return (await discoverCommands(workspace)).commands.map((command) => command.name);
 }
 
+/**
+ * The CLI's own workflows, which `discoverCommands` publishes ahead of every skill. `/boost` and
+ * `/browser` were probed 2026-09-24 (see Task 19 in tasks/todo.md) and are listed here so the
+ * index-based assertions below cannot drift when one is added.
+ */
+const CLI_WORKFLOWS = [
+  "plan",
+  "goal",
+  "grill-me",
+  "teamwork-preview",
+  "learn",
+  "schedule",
+  "boost",
+  "browser",
+] as const;
+
 describe("discoverCommands", () => {
   it("offers the CLI's own workflows first", async () => {
-    expect((await discoverCommands(workspace)).commands).toEqual([
-      { name: "plan", description: expect.any(String) },
-      { name: "goal", description: expect.any(String) },
-      { name: "grill-me", description: expect.any(String) },
-      { name: "teamwork-preview", description: expect.any(String) },
-      { name: "learn", description: expect.any(String) },
-      { name: "schedule", description: expect.any(String) },
-    ]);
+    expect((await discoverCommands(workspace)).commands).toEqual(
+      CLI_WORKFLOWS.map((name) => ({ name, description: expect.any(String) })),
+    );
   });
 
   it("finds a skill in every customization root the CLI reads", async () => {
@@ -64,7 +75,7 @@ describe("discoverCommands", () => {
     }
 
     const commands = (await discoverCommands(workspace)).commands;
-    expect(commands.slice(6)).toEqual([
+    expect(commands.slice(CLI_WORKFLOWS.length)).toEqual([
       { name: "root-0", description: "Root 0" },
       { name: "root-1", description: "Root 1" },
       { name: "root-2", description: "Root 2" },
@@ -94,14 +105,7 @@ describe("discoverCommands", () => {
     writeSkill(".agents", "not-a-skill", skill("name: not-a-skill"));
     rmSync(join(workspace, ".agents", "skills", "not-a-skill", "SKILL.md"));
 
-    expect(await names()).toEqual([
-      "plan",
-      "goal",
-      "grill-me",
-      "teamwork-preview",
-      "learn",
-      "schedule",
-    ]);
+    expect(await names()).toEqual([...CLI_WORKFLOWS]);
   });
 
   it("bounds a long description to one line", async () => {
@@ -166,7 +170,11 @@ describe("discoverCommands", () => {
       writeGlobalSkill(root, `global-${index}`, skill(frontmatter));
     }
 
-    expect((await names()).slice(6)).toEqual(["global-0", "global-1", "global-2"]);
+    expect((await names()).slice(CLI_WORKFLOWS.length)).toEqual([
+      "global-0",
+      "global-1",
+      "global-2",
+    ]);
   });
 
   it("keeps the workspace copy of a name the global roots also have", async () => {
