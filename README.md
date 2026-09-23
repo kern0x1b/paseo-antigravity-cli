@@ -59,6 +59,7 @@ The first one that resolves, in this order:
 | `session.configure` | Model, reasoning tier, mode, and settings. All of them are launch flags, so a change restarts the CLI on the next turn, resuming the same conversation with `--conversation <id>`. |
 | `session.list` | Imports existing Antigravity conversations by reading `~/.gemini/antigravity-cli/conversation_summaries.db` read-only. Filter by workspace, text, and limit; subagent runs are excluded. |
 | `session.persistence` | The conversation id agy reports is persisted, so reopening an agent resumes the same Antigravity conversation. |
+| `session.subsession` | Each subagent an `invoke_subagent` call starts is shown as a child session of the agent that spawned it, linked to its row, and follows the child's own transcript live (see [Subagents](#subagents)). |
 | `permission.tool_policy` | Accepted (Paseo rejects a session carrying a tool policy otherwise), but preapproved MCP tools cannot be forwarded: agy reads its own rules from `settings.json`. |
 
 Models come from `agy models` (cached for 10 minutes against the resolved binary's path and
@@ -70,7 +71,35 @@ Modes: *Default* (review file writes before they run), *Accept edits*, *Plan*.
 
 Tool rows are mapped from the CLI's own step parameters: shell commands, file reads and writes,
 edits (with a unified diff), `grep_search`/`find_by_name`/`list_dir`, `search_web`,
-`read_url_content`, subagents, and `call_mcp_tool` (shown as `server/tool`).
+`read_url_content`, `define_subagent`, and `call_mcp_tool` (shown as `server/tool`). Subagents
+get their own rows, below.
+
+## Subagents
+
+When the model delegates with `invoke_subagent`, agy starts each subagent as its own conversation
+in the background and keeps the parent turn open until their reports arrive. The plugin shows that
+in two layers:
+
+1. **A subagent row in the parent timeline**, built only from the parent's stream: one row per
+   subagent (one call may start several), with its type, role, and the prompt it was given. The
+   row stays *running* while the subagent works, and ends *completed* when the subagent finishes or
+   the turn succeeds, *canceled* when the turn is interrupted, and *failed* when the turn fails.
+2. **A child session per subagent.** agy names each subagent's transcript
+   (`~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`, handed out as
+   the step's `log_uri`). The plugin follows that file while the subagent runs and shows it as a
+   Paseo child session linked to the row: the subagent's prompt, each tool call with its result,
+   and its final answer. The row's text becomes the report the subagent sent back to the parent,
+   and the row lists the subagent's tool calls. The child's rows are stored like the parent's, so
+   reopening the agent with history restores its children too.
+
+The transcript file is agy-internal and undocumented, so the child session is best-effort: a
+missing or unreadable transcript, or one in a shape the plugin does not recognise, leaves the row
+from step 1 in place (the parent turn is never affected), and lines of an unknown kind are skipped.
+A subagent counts as finished when its transcript ends on an answer with no further tool call; the
+parent's own "report arrived" step is not used, because it arrives well after the transcript's last
+line and does not say which subagent it belongs to. The plugin stops following a transcript when
+the subagent finishes, when the session or the plugin closes, when the parent turn is interrupted or
+fails, when the file never shows up within a minute, or after ten minutes without a new line.
 
 ## Slash commands
 
@@ -181,7 +210,7 @@ Under `$PASEO_HOME` (default `~/.paseo`), in `plugin-data/antigravity-cli/`:
 
 | Path | Contents |
 |---|---|
-| `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload. Newest snapshot per row id, capped at 500 rows, flushed on close. Not written when the session has `persist: false`. |
+| `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload — a subagent's child session is stored the same way, under the subagent's own conversation id. Newest snapshot per row id, capped at 500 rows, flushed on close. Not written when the session has `persist: false`. |
 | `attachments/<sessionId>/<n>.<ext>` | Images decoded from prompts. Deleted on `session.close`. |
 | `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with. Deleted on `session.close`. |
 | `mcp-ledger.json` | Which `paseo-*` entries the plugin wrote, in which workspace, for which sessions, and the `info/exclude` lines it added there. |
@@ -190,10 +219,10 @@ Plus, only while sharing is on, `<cwd>/.agents/mcp_config.json` in the session's
 when that workspace is inside a git work tree, the two lines in that repository's local
 `info/exclude` that keep the file out of its commits.
 
-The plugin reads two things outside those directories: the `toolPermission` value in
-`~/.gemini/antigravity-cli/settings.json` (so the approval select can name it) and the
+The plugin reads three things outside those directories: the `toolPermission` value in
+`~/.gemini/antigravity-cli/settings.json` (so the approval select can name it), the
 conversation index `~/.gemini/antigravity-cli/conversation_summaries.db` (read-only, for session
-import).
+import), and, while a subagent runs, the transcript file agy names for it (read-only).
 
 ## Known limitations
 
@@ -219,6 +248,11 @@ import).
   workflows above are the ones probed by hand. A skill the CLI would refuse to load can therefore
   appear in the picker; choosing a command the CLI no longer expands sends `/<name>` as literal text
   and the model answers that text instead of running the workflow.
+- **Subagents are read-only in Paseo.** A child session shows what the subagent did, but it cannot
+  be prompted, and the plugin does not model agy's `@<subagent> <message>` syntax,
+  `manage_subagents`, `send_message`, or `browser_subagent` — those remain plain tool rows or text
+  sent to the parent. A child session relies on agy's undocumented transcript file; when a CLI
+  update changes it, subagents fall back to rows without a child session.
 
 ## Terms of service
 
@@ -234,7 +268,8 @@ The Google Antigravity Additional Terms of Service
 What this plugin does about that: it only launches the official `agy` binary you installed, and
 lets that binary use whatever session it already has. It never reads, stores, forwards, or
 refreshes credentials or OAuth tokens, and it never talks to Antigravity's APIs itself. It does read
-the `toolPermission` preference and the read-only conversation index described above.
+the `toolPermission` preference, the read-only conversation index, and subagent transcripts, as
+described above.
 
 If you need certainty about how your use is governed, the same terms open by saying that access
 through Gemini Enterprise (Google Cloud), Gemini Enterprise for Business, a Google Workspace

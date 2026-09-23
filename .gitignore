@@ -2,3 +2,4 @@ node_modules/
 tasks/plan.md
 tasks/todo.md
 .agents/
+tasks/subagents.md

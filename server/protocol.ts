@@ -39,6 +39,27 @@ const toolInfoSchema = z.object({
   output: z.string().optional(),
 });
 
+/** One child an `invoke_subagent` step spawned, as the subagent line reports it. */
+const subagentSchema = z.looseObject({
+  type_name: z.string().optional(),
+  role: z.string().optional(),
+  initial_prompt: z.string().optional(),
+  conversation_id: z.string().optional(),
+  /** `file:` URL of the child's own transcript, which is how a child can be followed. */
+  log_uri: z.string().optional(),
+  workspace_uris: z.array(z.string()).optional(),
+});
+
+/**
+ * A subagent step's payload. A shape agy cannot decode becomes `undefined` rather than failing the
+ * step: dropping it would also lose the row the `invoke_subagent` tool line had already published,
+ * while the children a malformed payload names are information this plugin can do without.
+ */
+const subagentInfoSchema = z
+  .looseObject({ subagents: z.array(subagentSchema).optional() })
+  .optional()
+  .catch(undefined);
+
 const stepUpdateSchema = z.object({
   conversation_id: z.string().optional(),
   step_index: z.number(),
@@ -48,6 +69,7 @@ const stepUpdateSchema = z.object({
   text_delta: z.string().optional(),
   tool_name: z.string().optional(),
   tool_info: toolInfoSchema.optional(),
+  subagent_info: subagentInfoSchema.optional(),
   duration_seconds: z.number().optional(),
   usage: usageSchema.optional(),
 });
@@ -85,6 +107,12 @@ export const STEP_USER_INPUT = "user_input";
 export const STEP_AGENT_RESPONSE = "agent_response";
 export const STEP_TOOL = "tool";
 export const STEP_SYSTEM_MESSAGE = "system_message";
+/**
+ * The step agy reports once the `invoke_subagent` call it shares a `step_index` with has been
+ * dispatched. It is the same step as the tool line, carrying `subagent_info` in place of
+ * `tool_info`, and it arrives while the children are still running.
+ */
+export const STEP_SUBAGENT = "subagent";
 
 export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";

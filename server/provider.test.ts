@@ -1,10 +1,12 @@
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -12,18 +14,23 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type {
-  ProviderConnection,
-  ProviderContent,
-  ProviderEvent,
-  ProviderInput,
-  ProviderPersistence,
-  ProviderSessionConfig,
-  ProviderSetting,
-  ProviderTimelineItem,
+import {
+  ProviderEventSchema,
+  ProviderInputSchema,
+  type ProviderConnection,
+  type ProviderContent,
+  type ProviderEvent,
+  type ProviderError,
+  type ProviderInput,
+  type ProviderPersistence,
+  type ProviderSessionConfig,
+  type ProviderSetting,
+  type ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { createProvider } from "./provider";
+import { parseTranscriptLines, renderChild } from "./subagents";
 import { writeConversationDb } from "./testing/conversation-db";
 
 const fakeAgy = fileURLToPath(new URL("./testing/fake-agy.mjs", import.meta.url));
@@ -47,11 +54,51 @@ let argvLog: string;
 let promptFile: string;
 let openConnections: ProviderConnection[];
 
+/**
+ * What Paseo's own schemas would reject, as `direction path: message`.
+ *
+ * The host decodes every event a provider emits with `ProviderEventSchema`, and a plugin that
+ * sends something it cannot decode takes the whole session down with a runtime failure rather
+ * than losing one row. Every event these tests cause — and every input they send — is decoded
+ * here, so a violation fails the test that caused it instead of only the assertion that noticed.
+ */
+let schemaViolations: string[];
+
+function check(schema: z.ZodType, value: unknown, direction: "input" | "event"): void {
+  const parsed = schema.safeParse(value);
+  if (parsed.success) return;
+  for (const issue of parsed.error.issues) {
+    const line = `${direction} ${issue.path.join(".")}: ${issue.message}`;
+    // Deduplicated: one kind of violation is one bug, and repeating it per event buries the rest.
+    if (!schemaViolations.includes(line)) schemaViolations.push(line);
+  }
+}
+
+/**
+ * Attaches the schema guard and the event log to a connection, and validates what is sent through
+ * it. Both directions go through the same schemas the daemon uses, so the tests cannot quietly
+ * exercise a message the daemon would refuse.
+ */
+function watchConnection(connection: ProviderConnection): ProviderEvent[] {
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => {
+    check(ProviderEventSchema, event, "event");
+    events.push(event);
+  });
+  const send = connection.send.bind(connection);
+  connection.send = async (input) => {
+    check(ProviderInputSchema, input, "input");
+    await send(input);
+  };
+  return events;
+}
+
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "antigravity-provider-"));
   argvFile = join(tempDir, "argv.json");
   argvLog = join(tempDir, "argv-log.jsonl");
   promptFile = join(tempDir, "prompts.jsonl");
+  schemaViolations = [];
 
   chmodSync(fakeAgy, 0o755);
   process.env.PASEO_ANTIGRAVITY_BIN = fakeAgy;
@@ -85,6 +132,9 @@ afterEach(async () => {
     "FAKE_SCHEMA_ERROR",
     "FAKE_SCHEMA_GATE",
     "FAKE_SCHEMA_STICKY",
+    "FAKE_SUBAGENT_COUNT",
+    "FAKE_SUBAGENT_TRANSCRIPT",
+    "FAKE_SUBAGENT_GATE",
     "FAKE_EDIT_FILE",
     "FAKE_EDIT_TOOL",
     "FAKE_EDIT_AFTER",
@@ -97,6 +147,9 @@ afterEach(async () => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
   rmSync(tempDir, { recursive: true, force: true });
+  // Last, so every test still cleans up after itself: a provider message the host cannot decode
+  // is a session-killing bug, and it is reported with the test that produced it.
+  expect(schemaViolations).toEqual([]);
 });
 
 interface Harness {
@@ -107,9 +160,7 @@ interface Harness {
 async function connect(): Promise<Harness> {
   const connection = await createProvider().connect({ versions: [1], capabilities: OFFERED });
   openConnections.push(connection);
-  const events: ProviderEvent[] = [];
-  connection.onEvent((event) => events.push(event));
-  return { connection, events };
+  return { connection, events: watchConnection(connection) };
 }
 
 function sessionConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSessionConfig {
@@ -1799,8 +1850,7 @@ describe("history replay", () => {
   async function replay(conversationId = CONVERSATION_ID): Promise<ProviderEvent[]> {
     const replayed = await createProvider().connect({ versions: [1], capabilities: OFFERED });
     openConnections.push(replayed);
-    const events: ProviderEvent[] = [];
-    replayed.onEvent((event) => events.push(event));
+    const events = watchConnection(replayed);
     await replayed.send({
       type: "session.open",
       requestId: "open-replay",
@@ -2337,6 +2387,611 @@ describe("slash commands", () => {
 
     await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
     await waitFor(() => turns(events, "canceled")[0], "the turn to be canceled");
+  });
+});
+
+describe("subagents", () => {
+  /** The child conversations the fake's `subagent` scenario runs, in the order it names them. */
+  const CHILD_A = "aaaaaaaa-0000-4000-8000-000000000000";
+  const CHILD_B = "aaaaaaaa-0000-4000-8000-000000000001";
+  const CONVERSATION_ID = "11111111-2222-3333-4444-555555555555";
+
+  type ToolRow = Extract<ProviderTimelineItem, { type: "tool_call" }>;
+  type OpenedSession = Extract<ProviderEvent, { type: "session.opened" }>;
+  interface ReportedChild {
+    index?: number;
+    conversationId?: string;
+    logUri?: string;
+    typeName?: string;
+    role?: string;
+    prompt?: string;
+    done?: boolean;
+  }
+
+  /**
+   * Points HOME at a temp home: the fake writes each child's transcript under
+   * `$HOME/.gemini/antigravity-cli/brain/<child conversation>/…`, which is where `log_uri` points.
+   */
+  function tempHome(): void {
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+  }
+
+  function subagentRows(events: ProviderEvent[]): ToolRow[] {
+    return timelineItems(events).filter(
+      (item): item is ToolRow => item.type === "tool_call" && item.detail.type === "sub_agent",
+    );
+  }
+
+  /**
+   * A file a child works on. The fake names it under its own `process.cwd()`, which is resolved —
+   * on macOS `/var` is a symlink to `/private/var`, and the CLI's cwd is the resolved path while
+   * the test's temp dir is the one it asked for.
+   */
+  function childFile(index: number): string {
+    return `${realpathSync(tempDir)}/subagent-${index}.txt`;
+  }
+
+  function reported(row: ToolRow): ReportedChild {
+    return (row.metadata?.subagent ?? {}) as ReportedChild;
+  }
+
+  /** The child session of one subagent row, as the row links to it. */
+  function childIdOf(events: ProviderEvent[], conversationId = CHILD_A): string {
+    return `session-1:subagent:${conversationId}`;
+  }
+
+  function childSessions(events: ProviderEvent[]): OpenedSession[] {
+    return events.filter(
+      (event): event is OpenedSession =>
+        event.type === "session.opened" && event.parentSessionId !== undefined,
+    );
+  }
+
+  function itemsFor(events: ProviderEvent[], sessionId: string): ProviderTimelineItem[] {
+    return events.flatMap((event) =>
+      event.type === "timeline.item" && event.sessionId === sessionId ? [event.item] : [],
+    );
+  }
+
+  /** Every `session.closed` a test saw, with the error it carried when it carried one. */
+  function closedSessions(
+    events: ProviderEvent[],
+    sessionId?: string,
+  ): Array<{ sessionId: string; error?: ProviderError }> {
+    return events.flatMap((event) =>
+      event.type === "session.closed" && (sessionId === undefined || event.sessionId === sessionId)
+        ? [{ sessionId: event.sessionId, ...(event.error ? { error: event.error } : {}) }]
+        : [],
+    );
+  }
+
+  /** Where one child's own terminal turn sits among the events, or -1. */
+  function turnIndex(events: ProviderEvent[], sessionId: string, state: string): number {
+    return events.findIndex(
+      (event) => event.type === "session.turn" && event.sessionId === sessionId && event.state === state,
+    );
+  }
+
+  function childEvents(events: ProviderEvent[], sessionId: string): ProviderEvent[] {
+    return events.filter(
+      (event) =>
+        (event.type === "timeline.item" || event.type === "session.turn") &&
+        event.sessionId === sessionId,
+    );
+  }
+
+  /** The file a child's `log_uri` names, which is what a test appends to behind the plugin's back. */
+  function childTranscriptFile(events: ProviderEvent[], conversationId = CHILD_A): string {
+    const uri = subagentRows(events)
+      .filter((row) => reported(row).conversationId === conversationId)
+      .map((row) => reported(row).logUri)
+      .find((value) => value !== undefined);
+    if (uri === undefined) throw new Error("no child transcript was reported");
+    return fileURLToPath(uri);
+  }
+
+  /** A last word for a child whose transcript a test finishes by hand. */
+  function finalChildLine(stepIndex: number): string {
+    return (
+      JSON.stringify({
+        step_index: stepIndex,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-09-23T19:49:42Z",
+        content: "I have read the file and reported its contents back to the parent agent.",
+      }) + "\n"
+    );
+  }
+
+  /**
+   * A line the child's transcript already holds. Appending it moves the file without moving any
+   * row: the step index it repeats replaces the line that was there, with the same content.
+   */
+  function repeatedChildLine(): string {
+    return (
+      JSON.stringify({
+        step_index: 4,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-09-23T19:49:34Z",
+        content: `Message sent to "${CONVERSATION_ID}".`,
+      }) + "\n"
+    );
+  }
+
+  async function startedTurn(text = "spawn a researcher"): Promise<Harness> {
+    process.env.FAKE_SCENARIO = "subagent";
+    tempHome();
+    const harness = await connect();
+    await openSession(harness.connection);
+    await prompt(harness.connection, text);
+    return harness;
+  }
+
+  /**
+   * Waits out one poll of the transcript tailer and a little more, for the two tests that assert
+   * *nothing* arrives. Real time is the point: the plugin follows a file on a real 500 ms interval
+   * with `fs.watch` events from the OS, and the writer is a separate process, so no fake clock in
+   * this process can drive the thing whose silence is being checked.
+   */
+  async function waitOutAPoll(): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 800);
+    await promise;
+  }
+
+  it("publishes a row per child, from its prompt first and then from its conversation", async () => {
+    const { events } = await startedTurn();
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const rows = subagentRows(events);
+    // The tool line names the children the model asked for, before any of them exists.
+    expect(rows[0]).toMatchObject({
+      name: "invoke_subagent",
+      status: "running",
+      error: null,
+      detail: {
+        type: "sub_agent",
+        subAgentType: "research",
+        description: "Researcher A",
+        log: `Please read the file ${childFile(0)} and report its exact contents.`,
+      },
+    });
+    expect(reported(rows[0]!)).toMatchObject({
+      index: 0,
+      typeName: "research",
+      role: "Researcher A",
+      prompt: `Please read the file ${childFile(0)} and report its exact contents.`,
+    });
+    // Neither the conversation nor the outcome is known when the call is made.
+    expect(reported(rows[0]!).conversationId).toBeUndefined();
+    expect(reported(rows[0]!).done).toBeUndefined();
+
+    // The subagent line of the same step fills in the conversation, and the child's own report
+    // settles the row: one row throughout, from the call that spawned it to what it answered.
+    const sameRow = rows.filter((row) => row.id === rows[0]?.id);
+    expect(sameRow.at(-1)).toMatchObject({
+      status: "completed",
+      error: null,
+      detail: {
+        type: "sub_agent",
+        subAgentType: "research",
+        description: "Researcher A",
+        childSessionId: childIdOf(events),
+        log: `The file \`${childFile(0)}\` contains:\n\n\`\`\`\nalpha\n\`\`\``,
+        actions: [
+          { index: 1, toolName: "view_file", summary: "Read subagent-0.txt" },
+          { index: 2, toolName: "send_message", summary: "Report subagent-0.txt" },
+        ],
+      },
+    });
+    expect(reported(sameRow.at(-1)!)).toMatchObject({
+      conversationId: CHILD_A,
+      logUri: expect.stringMatching(/^file:/),
+      done: true,
+    });
+
+    // The parent's own answer is untouched by any of it: no child text lands on its session, and
+    // the two things it said are exactly what Paseo holds for the ids they streamed under.
+    const parentEvents = events.filter(
+      (event) => event.type !== "timeline.item" || event.sessionId === "session-1",
+    );
+    expect([...paseoView(parentEvents).messages.values()]).toEqual([
+      "I have dispatched the research subagents to read their files.\n",
+      "Here are the contents reported by each subagent:\n",
+    ]);
+  });
+
+  it("opens the child's session linked to the row, with no capabilities of its own", async () => {
+    const { connection, events } = await startedTurn();
+    const childId = childIdOf(events);
+    const opened = await waitFor(
+      () => childSessions(events).find((event) => event.sessionId === childId),
+      "the child session to open",
+    );
+
+    expect(opened).toMatchObject({
+      parentSessionId: "session-1",
+      toolCallId: subagentRows(events)[0]?.id,
+      capabilities: [],
+      restoration: "parent",
+      title: "Researcher A",
+      description: `Please read the file ${childFile(0)} and report its exact contents.`,
+      cwd: tempDir,
+    });
+    // Nothing is pumped into a child: Paseo cannot address it, which is what the empty capability
+    // list means, and the provider agrees.
+    await expect(prompt(connection, "hello", "m2", childId)).rejects.toThrow("Unknown session");
+  });
+
+  it("gives the child its own rows, its own turn, and the answer it actually gave", async () => {
+    const { events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () =>
+        events.some(
+          (event) =>
+            event.type === "session.turn" && event.sessionId === childId && event.state === "completed",
+        )
+          ? true
+          : undefined,
+      "the child's turn to complete",
+    );
+
+    const childItems = itemsFor(events, childId);
+    expect(childItems.map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "tool_call",
+      "assistant_message",
+    ]);
+    expect(childItems[0]).toMatchObject({
+      text: `Please read the file ${childFile(0)} and report its exact contents.`,
+    });
+    expect(childItems[1]).toMatchObject({
+      name: "view_file",
+      status: "completed",
+      detail: { type: "read", filePath: childFile(0) },
+    });
+    expect(childItems[2]).toMatchObject({ name: "send_message", status: "completed" });
+    expect(
+      events.filter((event) => event.type === "session.turn" && event.sessionId === childId),
+    ).toMatchObject([
+      { turnId: `agy-sub:${CHILD_A}`, state: "started" },
+      { turnId: `agy-sub:${CHILD_A}`, state: "completed" },
+    ]);
+    // Paseo maps every assistant snapshot to a delta, so the child's rows must end at exactly the
+    // text the child answered with — republished as it is, not appended to.
+    expect(paseoView(childEvents(events, childId)).finalText).toBe(
+      `I have read ${childFile(0)} and reported its contents back to the parent agent.`,
+    );
+
+    // Its own turn ends, and its session closes with it: the host counts a child that is not
+    // closed as still live, and reports every live session as failed on the next reload.
+    expect(closedSessions(events, childId)).toEqual([{ sessionId: childId }]);
+    expect(
+      events.findIndex((event) => event.type === "session.closed" && event.sessionId === childId),
+    ).toBeGreaterThan(turnIndex(events, childId, "completed"));
+  });
+
+  it("follows every child of one call, each with its own row and session", async () => {
+    process.env.FAKE_SUBAGENT_COUNT = "2";
+    const { events } = await startedTurn();
+    await waitFor(
+      () => (childSessions(events).length === 2 ? true : undefined),
+      "both children to open",
+    );
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const byId = new Map(subagentRows(events).map((row) => [row.id, row]));
+    expect(byId.size).toBe(2);
+    expect([...byId.values()].map((row) => row.status)).toEqual(["completed", "completed"]);
+    expect([...byId.values()].map((row) => [reported(row).index, reported(row).role])).toEqual([
+      [0, "Researcher A"],
+      [1, "Researcher B"],
+    ]);
+    expect(childSessions(events).map((event) => event.sessionId).sort()).toEqual(
+      [childIdOf(events, CHILD_A), childIdOf(events, CHILD_B)].sort(),
+    );
+    expect(itemsFor(events, childIdOf(events, CHILD_B)).map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "tool_call",
+      "assistant_message",
+    ]);
+  });
+
+  it("falls back to the row the stream justified when a child's transcript is unreadable", async () => {
+    process.env.FAKE_SUBAGENT_TRANSCRIPT = "malformed";
+    const { events } = await startedTurn();
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // The turn is what settles the row; nothing is claimed about the child, and no session opens.
+    const settled = subagentRows(events).at(-1);
+    expect(settled).toMatchObject({ status: "completed", error: null });
+    expect(reported(settled!)).toMatchObject({ conversationId: CHILD_A });
+    expect(reported(settled!).done).toBeUndefined();
+    expect(childSessions(events)).toEqual([]);
+  });
+
+  it("falls back to the row the stream justified when a child writes no transcript", async () => {
+    process.env.FAKE_SUBAGENT_TRANSCRIPT = "missing";
+    const { events } = await startedTurn();
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(subagentRows(events).at(-1)).toMatchObject({ status: "completed", error: null });
+    expect(childSessions(events)).toEqual([]);
+  });
+
+  it("ignores a step type it does not know and still finishes the child", async () => {
+    process.env.FAKE_SUBAGENT_TRANSCRIPT = "unknown-type";
+    const { events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () =>
+        events.some(
+          (event) =>
+            event.type === "session.turn" && event.sessionId === childId && event.state === "completed",
+        )
+          ? true
+          : undefined,
+      "the child's turn to complete",
+    );
+
+    // The line nothing knows contributes no row, and the child's own last word still settles it.
+    expect(itemsFor(events, childId).map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "tool_call",
+      "assistant_message",
+    ]);
+    expect(subagentRows(events).at(-1)).toMatchObject({
+      status: "completed",
+      detail: { childSessionId: childId },
+    });
+  });
+
+  it("cancels a running subagent and stops following its transcript on interrupt", async () => {
+    // The gate holds the parent's answer, so the child is still running when the interrupt lands.
+    process.env.FAKE_SUBAGENT_GATE = join(tempDir, "subagent-gate");
+    const { connection, events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () => (itemsFor(events, childId).length === 3 ? true : undefined),
+      "the child's calls to arrive",
+    );
+    expect(
+      itemsFor(events, childId).flatMap((item) =>
+        item.type === "tool_call" ? [item.status] : [],
+      ),
+    ).toEqual(["completed", "completed"]);
+
+    // The child's transcript grows without saying anything new here — a step written twice, a line
+    // caught mid-write — and a row whose render has not moved must not go through Paseo again.
+    const published = subagentRows(events).length;
+    appendFileSync(childTranscriptFile(events), repeatedChildLine(), "utf8");
+    await waitOutAPoll();
+    expect(subagentRows(events)).toHaveLength(published);
+
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
+    await waitFor(() => turns(events, "canceled")[0], "the parent's turn to be canceled");
+    expect(subagentRows(events).at(-1)).toMatchObject({ status: "canceled", error: null });
+    await waitFor(
+      () =>
+        events.find(
+          (event) =>
+            event.type === "session.turn" && event.sessionId === childId && event.state === "canceled",
+        ),
+      "the child's turn to be canceled",
+    );
+    // A child that ended canceled closes with the same error: a silent close would read as a child
+    // that completed.
+    expect(closedSessions(events, childId)).toEqual([
+      { sessionId: childId, error: { message: "Interrupted" } },
+    ]);
+
+    // The child's transcript is finished by hand exactly where its last word would have gone — and
+    // that line is its last word, so the transcript now reads as a finished child. A tailer that
+    // stopped with the canceled turn must publish none of it: no row, and no completed turn for a
+    // child that was already settled canceled.
+    const settled = events.length;
+    const file = childTranscriptFile(events);
+    appendFileSync(file, finalChildLine(5), "utf8");
+    expect(
+      renderChild(parseTranscriptLines(readFileSync(file, "utf8")).entries, {
+        childConversationId: CHILD_A,
+        parentConversationId: CONVERSATION_ID,
+        cwd: tempDir,
+      }).done,
+    ).toBe(true);
+    await waitOutAPoll();
+    expect(childEvents(events.slice(settled), childId)).toEqual([]);
+    expect(subagentRows(events).at(-1)).toMatchObject({ status: "canceled" });
+  });
+
+  it("closes every child's session before the parent's and publishes nothing afterwards", async () => {
+    process.env.FAKE_SUBAGENT_GATE = join(tempDir, "subagent-gate");
+    const { connection, events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () => (itemsFor(events, childId).length === 3 ? true : undefined),
+      "the child's calls to arrive",
+    );
+
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed" && event.sessionId === "session-1"),
+      "the session to close",
+    );
+    // The child was still running, so the parent closes it — first, and with an error: a silent
+    // close would tell the host it had completed.
+    expect(closedSessions(events)).toEqual([
+      { sessionId: childId, error: { message: "The session was closed before the subagent finished" } },
+      { sessionId: "session-1" },
+    ]);
+
+    const settled = events.length;
+    appendFileSync(childTranscriptFile(events), finalChildLine(5), "utf8");
+    await waitOutAPoll();
+    expect(childEvents(events.slice(settled), childId)).toEqual([]);
+  });
+
+  it("closes a replayed child whose transcript is gone with an error", async () => {
+    // The gate holds the child open, so the turn ends with the child still running — and with the
+    // rows it had already produced stored under its own conversation.
+    process.env.FAKE_SUBAGENT_GATE = join(tempDir, "subagent-gate");
+    const { connection, events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () => (itemsFor(events, childId).length === 3 ? true : undefined),
+      "the child's calls to arrive",
+    );
+    const transcript = childTranscriptFile(events);
+
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
+    await waitFor(
+      () =>
+        events.find(
+          (event) =>
+            event.type === "session.turn" && event.sessionId === childId && event.state === "canceled",
+        ),
+      "the child's turn to be canceled",
+    );
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed" && event.sessionId === "session-1"),
+      "the session to close",
+    );
+
+    // Antigravity prunes its brain directory, so the next session finds the rows and no transcript.
+    rmSync(transcript, { force: true });
+
+    const replayConnection = await createProvider().connect({ versions: [1], capabilities: OFFERED });
+    openConnections.push(replayConnection);
+    const replayed = watchConnection(replayConnection);
+    await replayConnection.send({
+      type: "session.open",
+      requestId: "open-replay",
+      sessionId: "session-replay",
+      config: sessionConfig(),
+      history: "replay",
+      persistence: { version: 1, data: { conversationId: CONVERSATION_ID } },
+    } as ProviderInput);
+
+    // Its stored rows are replayed, and then the child ends where they do rather than staying open
+    // forever: there is nothing left to follow it through.
+    const replayChildId = `session-replay:subagent:${CHILD_A}`;
+    expect(itemsFor(replayed, replayChildId).map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "tool_call",
+    ]);
+    expect(closedSessions(replayed, replayChildId)).toEqual([
+      {
+        sessionId: replayChildId,
+        error: { message: "The subagent's transcript is no longer available" },
+      },
+    ]);
+  });
+
+  it("replays a child's session and rows together with the parent's", async () => {
+    const { connection, events } = await startedTurn();
+    const childId = childIdOf(events);
+    await waitFor(
+      () =>
+        events.some(
+          (event) =>
+            event.type === "session.turn" && event.sessionId === childId && event.state === "completed",
+        )
+          ? true
+          : undefined,
+      "the child to finish",
+    );
+    await waitFor(() => turns(events, "completed")[0], "the parent's turn to complete");
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed" && event.sessionId === "session-1"),
+      "the session to close",
+    );
+    // The child had settled when it finished, so the parent's own close does not close it again.
+    expect(closedSessions(events)).toEqual([{ sessionId: childId }, { sessionId: "session-1" }]);
+
+    const replayConnection = await createProvider().connect({ versions: [1], capabilities: OFFERED });
+    openConnections.push(replayConnection);
+    const replayed = watchConnection(replayConnection);
+    await replayConnection.send({
+      type: "session.open",
+      requestId: "open-replay",
+      sessionId: "session-replay",
+      config: sessionConfig(),
+      history: "replay",
+      persistence: { version: 1, data: { conversationId: CONVERSATION_ID } },
+    } as ProviderInput);
+
+    // The row now links to the id this parent session gives the child, and the child comes with
+    // the stored rows it produced, all of it before the parent says it is ready.
+    const replayChildId = `session-replay:subagent:${CHILD_A}`;
+    const row = subagentRows(replayed).at(-1);
+    expect(row?.detail).toMatchObject({
+      type: "sub_agent",
+      subAgentType: "research",
+      childSessionId: replayChildId,
+    });
+    expect(reported(row!)).toMatchObject({ conversationId: CHILD_A, done: true });
+    expect(itemsFor(replayed, replayChildId).map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "tool_call",
+      "assistant_message",
+    ]);
+
+    const rowIndex = replayed.findIndex(
+      (event) => event.type === "timeline.item" && event.item.id === row?.id,
+    );
+    const childOpen = replayed.findIndex(
+      (event) => event.type === "session.opened" && event.sessionId === replayChildId,
+    );
+    const childReady = replayed.findIndex(
+      (event) => event.type === "session.ready" && event.sessionId === replayChildId,
+    );
+    const parentReady = replayed.findIndex(
+      (event) => event.type === "session.ready" && event.sessionId === "session-replay",
+    );
+    expect(rowIndex).toBeGreaterThanOrEqual(0);
+    expect(childOpen).toBeGreaterThan(rowIndex);
+    expect(childReady).toBeGreaterThan(childOpen);
+    expect(parentReady).toBeGreaterThan(childReady);
+
+    // The child had already finished when it was stored, so its replayed session ends with its
+    // replayed turn — closed, and closed before the parent says it is ready: a child the host is
+    // still counting as live is one it reports as failed on the next connection loss.
+    expect(closedSessions(replayed, replayChildId)).toEqual([{ sessionId: replayChildId }]);
+    const childClosed = replayed.findIndex(
+      (event) => event.type === "session.closed" && event.sessionId === replayChildId,
+    );
+    expect(childClosed).toBeGreaterThan(turnIndex(replayed, replayChildId, "completed"));
+    expect(childClosed).toBeLessThan(parentReady);
+
+    await replayConnection.send({
+      type: "session.close",
+      requestId: "close-replay",
+      sessionId: "session-replay",
+    });
+    await waitFor(
+      () =>
+        replayed.find(
+          (event) => event.type === "session.closed" && event.sessionId === "session-replay",
+        ),
+      "the replayed session to close",
+    );
+    expect(closedSessions(replayed)).toEqual([
+      { sessionId: replayChildId },
+      { sessionId: "session-replay" },
+    ]);
   });
 });
 

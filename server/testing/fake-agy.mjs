@@ -6,7 +6,13 @@
  *   FAKE_ARGV_FILE       when set, the received argv is written here so tests can assert flags
  *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
- *                        | fail | tool-hang | stdin-closed | schema | schema-invalid
+ *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
+ *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
+ *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
+ *                             malformed (unreadable lines only), missing (no file at all), or
+ *                             unknown-type (valid, plus one step of a type nothing knows)
+ *   FAKE_SUBAGENT_GATE        file the `subagent` scenario waits for before the parent's final
+ *                             answer, so a test can watch a child stream while its turn runs
  *   FAKE_SCHEMA_OUTPUT   JSON the `schema` scenario returns as structured_output
  *   FAKE_SCHEMA_GATE     file the `schema` scenario waits for before answering, so a test can act
  *                        while that turn is still running
@@ -28,10 +34,13 @@
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
  *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
  */
-import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 
 const argv = process.argv.slice(2);
 
@@ -134,6 +143,115 @@ async function waitForGate(variable = "FAKE_EDIT_GATE") {
 // The queued scenario holds turn 1's answer until the second line arrives.
 let heldAnswer = null;
 
+/**
+ * One child of the `subagent` scenario. Ids are deterministic, so a test can find a child's own
+ * transcript from the id alone as well as from the `log_uri` the parent's stream reports.
+ */
+function subagentChildren(count) {
+  const children = [];
+  for (let index = 0; index < count; index += 1) {
+    const conversationId = `aaaaaaaa-0000-4000-8000-00000000000${index}`;
+    children.push({
+      conversationId,
+      role: `Researcher ${String.fromCharCode(65 + index)}`,
+      typeName: "research",
+      file: `${process.cwd()}/subagent-${index}.txt`,
+      // Where agy keeps a child conversation's own trajectory, which is what `log_uri` names.
+      path: join(
+        homedir(),
+        ".gemini",
+        "antigravity-cli",
+        "brain",
+        conversationId,
+        ".system_generated",
+        "logs",
+        "transcript.jsonl",
+      ),
+    });
+  }
+  return children;
+}
+
+/**
+ * The lines one child writes for itself, mirroring a captured child (fixtures/12-subagent-*): a
+ * prompt in agy's `<USER_REQUEST>` envelope, a `view_file` call with its result on the next line, a
+ * `send_message` reporting to the parent, and a last word of text with no call — which is the step
+ * that says the child is done. Every argument value is a JSON-encoded string, as agy writes them.
+ */
+function childTranscriptLines(child, parentConversationId) {
+  const prompt = `Please read the file ${child.file} and report its exact contents.`;
+  const name = basename(child.file);
+  const report = `The file \`${child.file}\` contains:\n\n\`\`\`\nalpha\n\`\`\``;
+  const step = (stepIndex, type, extra) =>
+    JSON.stringify({
+      step_index: stepIndex,
+      source: "MODEL",
+      type,
+      status: "DONE",
+      created_at: "2026-09-23T19:49:34Z",
+      ...extra,
+    });
+
+  const head = [
+    step(0, "USER_INPUT", {
+      source: "USER_EXPLICIT",
+      content: `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-23T22:49:34+03:00.\n</ADDITIONAL_METADATA>`,
+    }),
+    step(2, "GENERIC", { content: `File Path: \`file://${child.file}\`\n1: alpha\n2: \n` }),
+    step(1, "PLANNER_RESPONSE", {
+      tool_calls: [
+        {
+          name: "view_file",
+          args: {
+            AbsolutePath: JSON.stringify(child.file),
+            toolAction: JSON.stringify(`Reading ${name}`),
+            toolSummary: JSON.stringify(`Read ${name}`),
+          },
+        },
+      ],
+    }),
+    step(3, "PLANNER_RESPONSE", {
+      tool_calls: [
+        {
+          name: "send_message",
+          args: {
+            Message: JSON.stringify(report),
+            Recipient: JSON.stringify(parentConversationId),
+            toolAction: '"Sending report to parent"',
+            toolSummary: JSON.stringify(`Report ${name}`),
+          },
+        },
+      ],
+    }),
+    step(4, "GENERIC", { content: `Message sent to "${parentConversationId}".` }),
+  ];
+  // Complete lines that are not steps: nothing here can be followed, whatever else is configured.
+  if (process.env.FAKE_SUBAGENT_TRANSCRIPT === "malformed") {
+    return { head: ["not json\n", '{"no_step_index":true}\n'], tail: [] };
+  }
+  // A child that never writes anything at all: its transcript is never created.
+  if (process.env.FAKE_SUBAGENT_TRANSCRIPT === "missing") {
+    return { head: [], tail: [] };
+  }
+  // The child's own last word, written after the head so a gate can hold it back.
+  const lastWord = `I have read ${child.file} and reported its contents back to the parent agent.`;
+  const tail =
+    process.env.FAKE_SUBAGENT_TRANSCRIPT === "unknown-type"
+      ? // A step type nothing knows, written *before* the last word: the renderer reads "done" from
+        // the highest step, and that must not depend on a line it does not understand.
+        [step(5, "FOO", { content: "a step type nothing knows" }), step(6, "PLANNER_RESPONSE", { content: lastWord })]
+      : [step(5, "PLANNER_RESPONSE", { content: lastWord })];
+  return { head, tail };
+}
+
+/** Appends lines and yields, so a reader can see the file grow rather than only its end state. */
+async function writeChildLines(path, lines) {
+  if (lines.length === 0) return;
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${lines.join("\n")}\n`, "utf8");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
 const stepEvent = (stepIndex, state, stepType, extra = {}) => ({
   event: "step_update",
   step_update: {
@@ -201,7 +319,11 @@ function playQueued(text) {
 // Registered before any output is written, so a consumer that has seen `init` can rely on
 // SIGINT being handled rather than terminating the process by default.
 const toolEnding = process.env.FAKE_TOOL_END ?? "interrupt";
-if (scenario === "interrupt" || (scenario === "tool-hang" && toolEnding === "interrupt")) {
+if (
+  scenario === "interrupt" ||
+  scenario === "subagent" ||
+  (scenario === "tool-hang" && toolEnding === "interrupt")
+) {
   // Captured behaviour: SIGINT prints `error: interrupted` on stderr, emits a failed result
   // carrying the same marker, then exits with code 1.
   process.on("SIGINT", () => {
@@ -309,6 +431,92 @@ readline.createInterface({ input }).on("line", async (line) => {
 
   // Stay silent so the turn stays running until the test interrupts it.
   if (scenario === "interrupt") return;
+
+  if (scenario === "subagent") {
+    const requested = Number.parseInt(process.env.FAKE_SUBAGENT_COUNT ?? "1", 10);
+    const count = Number.isFinite(requested) && requested > 0 ? requested : 1;
+    const children = subagentChildren(count);
+    const prompts = new Map(
+      children.map((child) => [
+        child.conversationId,
+        `Please read the file ${child.file} and report its exact contents.`,
+      ]),
+    );
+
+    // Captured order: the tool line reports the call and the children it asked for, then the same
+    // step arrives again as the subagent line that names the conversations they run in.
+    const callStep = step;
+    step += 1;
+    send(
+      stepEvent(callStep, "ACTIVE", "tool", {
+        tool_name: "invoke_subagent",
+        tool_info: {
+          name: "invoke_subagent",
+          parameters: {
+            Subagents: children.map((child) => ({
+              Model: "inherit",
+              Prompt: prompts.get(child.conversationId),
+              Role: child.role,
+              TypeName: child.typeName,
+            })),
+          },
+        },
+      }),
+    );
+    send(
+      stepEvent(callStep, "DONE", "subagent", {
+        tool_name: "invoke_subagent",
+        duration_seconds: 0.048852,
+        subagent_info: {
+          subagents: children.map((child) => ({
+            type_name: child.typeName,
+            role: child.role,
+            initial_prompt: prompts.get(child.conversationId),
+            conversation_id: child.conversationId,
+            log_uri: pathToFileURL(child.path).href,
+            workspace_uris: [pathToFileURL(process.cwd()).href],
+          })),
+        },
+      }),
+    );
+
+    // The parent keeps talking while its children work, exactly as the captured turn did.
+    const narration = "I have dispatched the research subagents to read their files.";
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: narration }));
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "\n", usage: stepUsage }));
+    step += 1;
+
+    const transcripts = children.map((child) => ({
+      child,
+      lines: childTranscriptLines(child, conversationId),
+    }));
+    for (const { child, lines } of transcripts) {
+      // A child writes in bursts and not always in step order (step 2 before step 1 was captured),
+      // so the head is written in two parts with the file left mid-stream.
+      await writeChildLines(child.path, lines.head.slice(0, 2));
+      await writeChildLines(child.path, lines.head.slice(2));
+    }
+    // Everything above is written before the parent's answer, so a test that opens the gate can
+    // watch a child report while the parent's own turn is still running.
+    await waitForGate("FAKE_SUBAGENT_GATE");
+
+    for (const { child, lines } of transcripts) {
+      await writeChildLines(child.path, lines.tail);
+    }
+    // One system message per child, which is how agy tells the parent a child reported; it carries
+    // nothing that says which child, and it arrives long after the child's own transcript has.
+    for (let index = 0; index < children.length; index += 1) {
+      send(stepEvent(step, "DONE", "system_message", { duration_seconds: 0.000249 }));
+      step += 1;
+    }
+
+    const answer = `Here are the contents reported by each subagent:\n`;
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: answer }));
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "", usage: stepUsage }));
+    step += 1;
+    sendResult(turnResult(turns, `${narration}\n${answer}`));
+    return;
+  }
 
   if (scenario === "tool-hang") {
     // The tool stays ACTIVE: the turn only ends when the test interrupts it, agy reports an

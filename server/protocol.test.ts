@@ -216,4 +216,58 @@ describe("captured agy fixtures", () => {
     ).toBe(false);
     expect(isInterrupted({ status: "SUCCESS", response: "ok" })).toBe(false);
   });
+
+  it("decodes the two lines one invoke_subagent call is reported through", () => {
+    const steps = loadFixture("12-subagents.ndjson").flatMap((event) =>
+      event.kind === "step_update" ? [event.step] : [],
+    );
+    const tool = steps.find(
+      (step) => step.step_type === "tool" && step.tool_name === "invoke_subagent",
+    );
+    const subagent = steps.find((step) => step.step_type === "subagent");
+
+    // The same step index, reported twice: first as the tool call, then as what it spawned.
+    expect(tool?.state).toBe("ACTIVE");
+    expect(subagent?.state).toBe("DONE");
+    expect(subagent?.step_index).toBe(tool?.step_index);
+
+    const parameters = tool?.tool_info?.parameters as
+      | { Subagents?: Array<{ Role?: string; TypeName?: string; Prompt?: string }> }
+      | undefined;
+    expect(parameters?.Subagents?.map((entry) => [entry.TypeName, entry.Role])).toEqual([
+      ["research", "Researcher A"],
+      ["research", "Researcher B"],
+    ]);
+
+    const children = subagent?.subagent_info?.subagents ?? [];
+    expect(children.map((child) => child.role)).toEqual(["Researcher A", "Researcher B"]);
+    expect(children[0]).toMatchObject({
+      type_name: "research",
+      initial_prompt: "Please read the file /Users/dev/agy-subagent-probe2/a.txt and report its exact contents.",
+      conversation_id: "15363ad9-3485-4249-aee7-a7605879f405",
+      workspace_uris: ["file:///Users/dev/agy-subagent-probe2"],
+    });
+    expect(children[0]?.log_uri).toMatch(
+      /^file:\/\/.*15363ad9-3485-4249-aee7-a7605879f405\/\.system_generated\/logs\/transcript\.jsonl$/,
+    );
+  });
+
+  it("drops a subagent payload it cannot decode without losing the step", () => {
+    // The row the tool line already published is worth more than the children of a shape agy
+    // cannot have meant, so a bad payload costs the payload and nothing else.
+    const event = parseAgyLine(
+      '{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"subagent","subagent_info":{"subagents":"nope"}}}',
+    );
+    expect(event?.kind).toBe("step_update");
+    if (event?.kind !== "step_update") return;
+    expect(event.step.subagent_info).toBeUndefined();
+    expect(event.step.step_type).toBe("subagent");
+
+    const odd = parseAgyLine(
+      '{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"subagent","subagent_info":{"something_new":1}}}',
+    );
+    expect(odd?.kind).toBe("step_update");
+    if (odd?.kind !== "step_update") return;
+    expect(odd.step.subagent_info).toEqual({ something_new: 1 });
+  });
 });
