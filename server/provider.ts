@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute } from "node:path";
 import {
   negotiateProviderCapabilities,
   requireProviderCapabilities,
@@ -18,6 +20,7 @@ import {
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import { AgyProcess } from "./agy";
+import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
 import {
   isObservedTool,
@@ -33,7 +36,9 @@ import {
   catalogCacheKey,
   currentModels,
   invalidateCatalogCache,
+  resolveThinking,
 } from "./catalog";
+import { MAX_SKILL_BYTES, discoverCommands, renderSkillPrompt } from "./commands";
 import {
   STEP_AGENT_RESPONSE,
   STEP_STATE_DONE,
@@ -46,7 +51,10 @@ import {
   type AgyStepUpdate,
   type AgyUsage,
 } from "./protocol";
-import { TranscriptStore } from "./transcript";
+import { injectMcpServers, mcpConfigPath, releaseMcpServers, sweepMcpLedger } from "./mcp";
+import { pluginDataDir, unsafePathChars } from "./plugindata";
+import { listConversations } from "./sessions";
+import { TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -70,6 +78,10 @@ const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
  * active turn instead. `permission` is absent because agy resolves approvals internally and
  * cannot surface them over this protocol.
  *
+ * `prompt.command` is supported by relaunching: a command turn runs on a CLI launched without
+ * `--disable-slash-commands`, and the next plain turn relaunches with it again (see the launch
+ * profile), because that flag also decides whether plain text starting with `/` expands.
+ *
  * `permission.tool_policy` is accepted because `session.open` is rejected outright when the
  * config carries a `toolPolicy` and the capability is missing. Preapproved MCP tools cannot be
  * forwarded to agy, which reads its own rules from settings.json; that is covered by the MCP
@@ -77,7 +89,17 @@ const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
  */
 const CAPABILITIES = [
   "prompt.message",
+  // A slash command reaches the CLI as `/<name> <arguments>` on a process launched for it.
+  "prompt.command",
+  // Images cannot go over the stream (agy rejects image blocks), so they are written to the
+  // plugin's attachments folder and referenced by path in the text.
+  "prompt.image",
+  // `--json-schema` makes agy decode the answer against a schema; the turn's last assistant row
+  // then holds that JSON (see the SUCCESS branch of `handleResult`).
+  "prompt.output_schema",
   "session.configure",
+  // Antigravity's own conversation index is readable, which is what makes import possible.
+  "session.list",
   "session.persistence",
   "permission.tool_policy",
 ] as const;
@@ -110,8 +132,15 @@ interface Session {
   readonly config: ProviderSessionConfig;
   readonly agyPath?: string;
   readonly extraArgs?: readonly string[];
+  /** Absolute, existing directories from `providerOptions.addDirs`, passed as extra --add-dir. */
+  readonly addDirs: readonly string[];
   settings: Record<string, JsonValue>;
-  selection: { model?: string; mode?: string };
+  /**
+   * The composer's selectors. `model` and `thinkingOption` are kept as they were chosen — a
+   * persisted full slug such as `gemini-3.8-flash-high` stays itself — and are resolved together
+   * into the `--model` slug at launch (`resolveThinking`).
+   */
+  selection: { model?: string; mode?: string; thinkingOption?: string };
   conversationId: string | null;
   /** `persist: false` keeps the conversation resumable but writes no timeline to disk. */
   readonly persist: boolean;
@@ -121,6 +150,31 @@ interface Session {
   process: AgyProcess | null;
   /** Set when a selector changed but the CLI still runs with the previous launch flags. */
   needsRestart: boolean;
+  /** The one schema file this session's `--json-schema` points at. */
+  readonly schemaPath: string;
+  /**
+   * What the *next* launch must carry. `--json-schema` and `--disable-slash-commands` are fixed at
+   * launch, so a turn that needs a different profile replaces the CLI first.
+   */
+  launchPending: LaunchProfile;
+  /** What the running CLI was actually launched with. */
+  launchActive: LaunchProfile;
+  /** Extra `--add-dir` holding attached images; null when the folder could not be created. */
+  readonly attachmentsDir: string | null;
+  /** Number of images written for this session, so filenames stay unique within it. */
+  attachmentCount: number;
+  /**
+   * Where the workspace's `.agents/mcp_config.json` stands for this session: `applied` when the
+   * plugin's entries are in it, `error` when the last attempt failed and reported why, and
+   * `released` when nothing of this session's is (or should be) in it.
+   */
+  mcp: "applied" | "released" | "error";
+  /**
+   * Names the composer was shown as plugin-expanded when this session opened. A command the user
+   * picks from that list is served from a fresh read of the same roots; this set is what tells a
+   * name that has since disappeared from a name the CLI expands itself.
+   */
+  publishedSkills: Set<string>;
   systemPromptSent: boolean;
   turnCounter: number;
   /** Turns written to agy that have not reported a result yet, oldest first. */
@@ -140,6 +194,19 @@ interface Session {
 }
 
 /**
+ * The launch-time flags that decide how a turn is served. All of them are fixed for the life of
+ * the process, so a prompt that needs another profile gets a relaunched CLI instead.
+ */
+interface LaunchProfile {
+  /** Launched with `--json-schema`: the turn's answer is decoded JSON, not prose. */
+  schema: boolean;
+  /** Launched without `--disable-slash-commands`: `/name` expands, in a command turn only. */
+  commands: boolean;
+  /** The skill directory this process may read, for a plugin-expanded skill's turn, else null. */
+  skillDir: string | null;
+}
+
+/**
  * agy runs queued stdin lines in order, so the *oldest* pending turn owns every incoming event:
  * a prompt sent while another turn is streaming must not relabel that turn's rows or clear the
  * text it has already accumulated.
@@ -153,6 +220,14 @@ interface PendingTurn {
   /** The target file as it was when a snapshot tool started, keyed by call id. */
   readonly snapshots: Map<string, Promise<FileSnapshot | null>>;
   hadAssistantText: boolean;
+  /**
+   * Whether the CLI serving this turn was launched with `--json-schema`. Antigravity keeps a
+   * schema with the *conversation* and reports the last `structured_output` again on later turns
+   * of that conversation, even on a process started without the flag (probed 2026-09-23), so the
+   * flag is what distinguishes this turn's answer from a stale one. The same flag decides that the
+   * turn's text is buffered instead of streamed (see `handleStepUpdate`).
+   */
+  schema: boolean;
   /**
    * `input_tokens` of the last agent_response step that reported usage: the size the model's
    * context had reached, as opposed to the result's total across every step of the turn.
@@ -210,17 +285,20 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
       closed = true;
       const running: AgyProcess[] = [];
       const flushing: Promise<void>[] = [];
+      const releasing: Promise<void>[] = [];
       for (const session of state.sessions.values()) {
         session.closing = true;
         if (session.process) running.push(session.process);
         session.process = null;
         if (session.transcript) flushing.push(session.transcript.flush());
+        // A close without a session.close: entries this connection injected still belong to it.
+        releasing.push(releaseMcpServers(session.sessionId));
       }
       state.sessions.clear();
       listeners.clear();
       // The rows of the last turn are still inside the debounce window, so flushing before the
       // processes are disposed is what lets a reload replay the answer that just finished.
-      await Promise.all(flushing);
+      await Promise.all([...flushing, ...releasing]);
       await Promise.all(running.map((process) => process.dispose()));
     },
   };
@@ -248,6 +326,13 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
   switch (input.type) {
     case "catalog":
       emit({ type: "catalog", requestId: input.requestId, catalog: await buildCatalog() });
+      return;
+    case "sessions":
+      emit({
+        type: "sessions",
+        requestId: input.requestId,
+        sessions: listConversations({ cwd: input.cwd, query: input.query, limit: input.limit }),
+      });
       return;
     case "session.open":
       await openSession(input, state, emit);
@@ -278,16 +363,30 @@ async function openSession(
   const conversationId = readConversationId(input.persistence);
   const options = readProviderOptions(config);
   const persist = config.persist !== false;
+  const attachmentsDir = await prepareAttachmentsDir(input.sessionId);
+  const addDirs = await checkAddDirs(options.addDirs);
+
+  // Computed before this session joins the map: a conversation with no timeline of this plugin's
+  // own is one that already existed in Antigravity. Another open session's rows may still be
+  // inside its write debounce, so those count as stored too.
+  const knownHistory =
+    conversationId !== null &&
+    (transcriptExists(conversationId) ||
+      [...state.sessions.values()].some(
+        (other) => other.conversationId === conversationId && other.transcript !== null,
+      ));
 
   const session: Session = {
     sessionId: input.sessionId,
     config,
     agyPath: options.agyPath,
     extraArgs: options.extraArgs,
+    addDirs: addDirs.kept,
     settings: { ...config.settings },
     selection: {
       model: config.model,
       mode: config.mode ?? DEFAULT_MODE_ID,
+      thinkingOption: config.thinkingOption,
     },
     conversationId,
     persist,
@@ -296,6 +395,14 @@ async function openSession(
     unpersisted: [],
     process: null,
     needsRestart: false,
+    // One file per session: rewritten before each schema turn, removed on close.
+    schemaPath: pluginDataDir("schemas", `${input.sessionId.replace(unsafePathChars, "_")}.json`),
+    launchPending: { schema: false, commands: false, skillDir: null },
+    launchActive: { schema: false, commands: false, skillDir: null },
+    attachmentsDir,
+    attachmentCount: 0,
+    mcp: "released",
+    publishedSkills: new Set(),
     systemPromptSent: conversationId !== null,
     turnCounter: 0,
     pendingTurns: [],
@@ -318,15 +425,52 @@ async function openSession(
     cwd: config.cwd,
   });
   emit({ type: "session.config", sessionId: input.sessionId, config: configState(session) });
+  // The composer's command picker is filled from this event, and only what arrives before
+  // `session.ready` reaches it — including for the throwaway probe a draft opens. Which of these
+  // names this plugin expands itself is kept: a later prompt re-reads the roots, and this is what
+  // separates a skill that has since disappeared from a name the CLI expands on its own.
+  const discovered = await discoverCommands(config.cwd);
+  session.publishedSkills = new Set(discovered.expanded.keys());
+  emit({
+    type: "session.commands",
+    sessionId: input.sessionId,
+    commands: [...discovered.commands],
+  });
 
-  if (Object.keys(config.mcpServers).length > 0) {
+  await syncSessionMcp(session, emit);
+  // Leftovers from a process that died without releasing its entries: the ledger is the only
+  // record of them, and this is where the set of live sessions is known.
+  await sweepMcpLedger(new Set(state.sessions.keys()));
+  if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
     emitNotice(
       session,
       emit,
       "mcp-unsupported",
       "warning",
       "MCP servers are not applied",
-      "Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json and .agents/mcp_config.json. Add them there, or run `agy mcp add`.",
+      `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.`,
+    );
+  }
+  if (addDirs.dropped.length > 0) {
+    emitNotice(
+      session,
+      emit,
+      "add-dirs-dropped",
+      "warning",
+      "Some extra directories were ignored",
+      `providerOptions.addDirs only accepts absolute paths to existing directories. Not passed to Antigravity: ${addDirs.dropped.join(", ")}.`,
+    );
+  }
+  if (conversationId !== null && !knownHistory) {
+    // A conversation resumed from Antigravity's own store was never written by this plugin, so
+    // there is nothing to replay. The history is not lost: the CLI still holds it.
+    emitNotice(
+      session,
+      emit,
+      "history-unavailable",
+      "info",
+      "Earlier history is not shown",
+      "This conversation already existed in Antigravity, so its earlier turns are not part of Paseo's timeline and are not replayed. Antigravity still has them, and the next reply continues the conversation.",
     );
   }
   if (config.systemPrompt && config.systemPrompt.trim().length > 0) {
@@ -349,6 +493,80 @@ async function openSession(
   emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
 }
 
+/**
+ * Creates the folder attached images are written to. It is passed to every launch, so a session
+ * that cannot create it still opens: plain turns run without the extra directory, and an image
+ * prompt fails with `attachment_failed`.
+ */
+async function prepareAttachmentsDir(sessionId: string): Promise<string | null> {
+  const dir = attachmentsDir(sessionId);
+  try {
+    await mkdir(dir, { recursive: true });
+    return dir;
+  } catch (error) {
+    console.error(`[antigravity] could not create ${dir}: ${describe(error)}`);
+    return null;
+  }
+}
+
+/**
+ * Makes the workspace's `.agents/mcp_config.json` hold this session's servers exactly when the
+ * sharing toggle is on. agy reads that file at startup, so this runs on the way to a launch: at
+ * `session.open`, and at the start of a turn whose process is being replaced (the relaunch the
+ * toggle raises). A failed attempt is reported once and left until the toggle is switched off and
+ * on again, rather than re-reported on every turn.
+ */
+async function syncSessionMcp(session: Session, emit: Emit): Promise<void> {
+  const servers = session.config.mcpServers;
+  if (!isSettingOn(session.settings.shareMcp) || Object.keys(servers).length === 0) {
+    if (session.mcp === "released") return;
+    session.mcp = "released";
+    await releaseMcpServers(session.sessionId);
+    return;
+  }
+  if (session.mcp !== "released") return;
+
+  const result = await injectMcpServers({
+    cwd: session.config.cwd,
+    sessionId: session.sessionId,
+    servers,
+  });
+  if (result.status === "invalid") {
+    session.mcp = "error";
+    emitNotice(
+      session,
+      emit,
+      "mcp-config-invalid",
+      "warning",
+      "Paseo tools were not shared",
+      `${result.path} exists but is not valid JSON, so it was left untouched. Fix or remove it, then turn sharing off and on again.`,
+    );
+    return;
+  }
+  if (result.status === "failed") {
+    session.mcp = "error";
+    emitNotice(
+      session,
+      emit,
+      "mcp-config-failed",
+      "warning",
+      "Paseo tools were not shared",
+      `${result.path} could not be written: ${result.message}`,
+    );
+    return;
+  }
+  session.mcp = "applied";
+  if (result.status === "unchanged") return;
+  emitNotice(
+    session,
+    emit,
+    "mcp-shared",
+    "warning",
+    "Paseo tools are shared with Antigravity",
+    `Antigravity loads Paseo's MCP servers from ${result.path}. That file holds the credentials those servers use (HTTP headers, or environment variables for stdio servers), so keep it out of version control: add .agents/ to your .gitignore. The Paseo entries are removed when the last Paseo session in this folder closes.`,
+  );
+}
+
 async function promptSession(
   input: Extract<ProviderInput, { type: "session.prompt" }>,
   state: ConnectionState,
@@ -357,19 +575,109 @@ async function promptSession(
   const session = requireSession(state, input.sessionId);
   const { prompt } = input;
 
-  await applyPendingRestart(session);
+  // Which command the user picked decides the launch, so the list is read again here rather than
+  // trusted from `session.open`: a skill may have been installed, removed, or renamed since.
+  const command = prompt.input.type === "command" ? prompt.input : null;
+  const discovered = command === null ? null : await discoverCommands(session.config.cwd);
+  const skill = command === null ? null : (discovered?.expanded.get(command.name) ?? null);
+  const unlisted =
+    command !== null &&
+    discovered !== null &&
+    !discovered.commands.some((entry) => entry.name === command.name);
+  // The composer offered this name as one this plugin expands, and the roots no longer have it:
+  // sending `/<name>` would only get the model answering the literal text.
+  if (skill === null && command !== null && unlisted && session.publishedSkills.has(command.name)) {
+    failPrompt(session, emit, prompt.clientMessageId, {
+      message: `The skill "${command.name}" is no longer installed where this plugin expands skills from (~/.agents/skills). Reinstall it, or reopen the session if it was just added.`,
+      code: "skill_unavailable",
+    });
+    return;
+  }
+  const profile: LaunchProfile = {
+    schema: prompt.outputSchema !== undefined,
+    // A plugin-expanded skill never reaches the CLI as a slash name, so it needs no expansion —
+    // and must not have it, or a body containing `/...` could be parsed as a command.
+    commands: command !== null && skill === null,
+    skillDir: skill?.dir ?? null,
+  };
+  // `--json-schema`, `--add-dir` and `--disable-slash-commands` belong to the process, not the
+  // turn, and the CLI cannot be replaced while it still owes a turn — so a prompt whose profile
+  // the running CLI cannot serve is refused rather than queued into it.
+  const refusal = queuedRefusal(session, profile);
+  if (refusal !== null) {
+    failPrompt(session, emit, prompt.clientMessageId, { message: refusal, code: "busy" });
+    return;
+  }
 
-  // `prompt.command` and `prompt.steer` are not advertised, so a prompt is always a message.
-  const text = prompt.input.type === "message" ? renderContent(prompt.input.content) : "";
+  // Read before the turn is announced: a skill that vanished since the picker was filled fails
+  // the prompt instead of starting a turn the CLI cannot answer.
+  let expanded: string | null = null;
+  if (command !== null && skill !== null) {
+    const rendered = await renderSkillPrompt(skill, command.arguments.trim());
+    if (rendered.kind !== "text") {
+      failPrompt(session, emit, prompt.clientMessageId, {
+        message:
+          rendered.kind === "too_large"
+            ? `${skill.path} is ${rendered.bytes} bytes, and this plugin sends at most ${MAX_SKILL_BYTES / 1024} KiB of a skill it expands itself. Install the skill for Antigravity itself (see the README) or shorten it.`
+            : `The skill "${skill.name}" could not be read: ${rendered.message}. Reinstall it, or run \`/skills reload\` in Antigravity if it was just installed.`,
+        code: rendered.kind === "too_large" ? "skill_too_large" : "skill_unavailable",
+      });
+      return;
+    }
+    expanded = rendered.text;
+  }
+
+  if (profile.schema) {
+    try {
+      await mkdir(dirname(session.schemaPath), { recursive: true });
+      await writeFile(session.schemaPath, JSON.stringify(prompt.outputSchema), "utf8");
+    } catch (error) {
+      failPrompt(session, emit, prompt.clientMessageId, {
+        message: `Could not write the output schema for Antigravity: ${describe(error)}`,
+        code: "schema_failed",
+      });
+      return;
+    }
+  }
+  session.launchPending = profile;
+
+  // A schema prompt always gets a fresh CLI (the file it read may have changed since), and any
+  // prompt that needs the other profile must not be served by the process running now.
+  const sameLaunch =
+    session.launchActive.schema === profile.schema &&
+    session.launchActive.commands === profile.commands &&
+    session.launchActive.skillDir === profile.skillDir;
+  if (session.process?.running && (!sameLaunch || profile.schema)) session.needsRestart = true;
+  await applyPendingRestart(session);
+  // The CLI reads the workspace MCP config at startup and only this path spawns one, so a toggle
+  // change lands here; a turn queued behind a running one waits for its own relaunch instead.
+  if (session.pendingTurns.length === 0) await syncSessionMcp(session, emit);
+
+  // What the timeline shows the user typed, and what the CLI is actually sent. A native command
+  // is expanded by the CLI, so both are the same `/<name> <arguments>`; a plugin-expanded skill is
+  // sent as the skill's own instructions, while the row still reads the command that was picked.
+  let typed = "";
+  let text = "";
+  if (command !== null) {
+    const args = command.arguments.trim();
+    // The leading `/name` is what the CLI expands, so it goes out as the first token of the turn.
+    typed = args.length > 0 ? `/${command.name} ${args}` : `/${command.name}`;
+    text = expanded ?? typed;
+  } else if (prompt.input.type === "message") {
+    try {
+      text = await renderPromptContent(session, prompt.input.content);
+    } catch (error) {
+      failPrompt(session, emit, prompt.clientMessageId, {
+        message: `Could not attach the prompt's image: ${describe(error)}`,
+        code: "attachment_failed",
+      });
+      return;
+    }
+  }
   if (text.trim().length === 0) {
-    emit({
-      type: "session.prompt_result",
-      sessionId: session.sessionId,
-      clientMessageId: prompt.clientMessageId,
-      result: {
-        type: "failed",
-        error: { message: "Antigravity requires a non-empty text prompt", code: "empty_prompt" },
-      },
+    failPrompt(session, emit, prompt.clientMessageId, {
+      message: "Antigravity requires a non-empty text prompt",
+      code: "empty_prompt",
     });
     return;
   }
@@ -381,12 +689,15 @@ async function promptSession(
     tools: new Map(),
     snapshots: new Map(),
     hadAssistantText: false,
+    // Replaced below with the launch profile of the process that actually serves the turn: a turn
+    // queued behind another is answered by that process, not by the one its own prompt implies.
+    schema: false,
   };
 
   publish(session, emit, {
     type: "user_message",
     id: `user:${turn.turnId}`,
-    text,
+    text: typed.length > 0 ? typed : text,
     clientMessageId: prompt.clientMessageId,
   });
   emit({
@@ -401,9 +712,16 @@ async function promptSession(
     // Picking the process first: replacing a CLI whose stdin died settles the turns that CLI still
     // owed, and this turn must not be counted among them.
     const process = ensureProcess(session, emit);
+    turn.schema = session.launchActive.schema;
     session.pendingTurns.push(turn);
-    await process.writeTurn(buildOutgoingText(session, text));
-    session.systemPromptSent = true;
+    if (command !== null && expanded === null) {
+      // The CLI expands `/name` only as the first token of a turn, so the system prompt's preamble
+      // waits for the first plain message rather than pushing the command out of that position.
+      await process.writeTurn(text);
+    } else {
+      await process.writeTurn(buildOutgoingText(session, text));
+      session.systemPromptSent = true;
+    }
   } catch (error) {
     session.pendingTurns = session.pendingTurns.filter((pending) => pending !== turn);
     emit({
@@ -414,6 +732,35 @@ async function promptSession(
       error: { message: describe(error), code: "agy_launch_failed" },
     });
   }
+}
+
+/**
+ * Why a prompt cannot be queued behind the turn already running, or null when it can. agy serves
+ * every turn of a process with that process's launch flags, so a prompt that needs the other
+ * profile would be answered under the wrong ones, and the CLI cannot be replaced until the turn it
+ * still owes has finished.
+ */
+function queuedRefusal(session: Session, profile: LaunchProfile): string | null {
+  if (session.pendingTurns.length === 0) return null;
+  if (profile.schema) {
+    return "Antigravity applies a structured-output schema to the whole process, so this prompt cannot be queued behind a running turn. Wait for the turn to finish and send it again.";
+  }
+  if (profile.commands) {
+    return "Antigravity expands slash commands only on a CLI launched without --disable-slash-commands, and that CLI cannot be replaced while it is still answering. Wait for the turn to finish and send the command again.";
+  }
+  if (profile.skillDir !== null) {
+    return "This skill is expanded by the plugin, which gives the CLI the skill's own directory for that turn alone, and the CLI cannot be replaced while it is still answering. Wait for the turn to finish and send the command again.";
+  }
+  if (session.launchActive.schema) {
+    return "Antigravity is answering a structured-output request, and applies its schema to every turn of that process. Wait for the turn to finish and send this again.";
+  }
+  if (session.launchActive.commands) {
+    return "Antigravity is running a slash command on a CLI launched without --disable-slash-commands, so a plain message could be expanded as a command instead of answered. Wait for the turn to finish and send it again.";
+  }
+  if (session.launchActive.skillDir !== null) {
+    return "Antigravity is running a turn that was given an extra skill directory, and that CLI cannot be replaced while it is still answering. Wait for the turn to finish and send this again.";
+  }
+  return null;
 }
 
 async function interruptSession(
@@ -449,6 +796,10 @@ async function configureSession(
   }
   if (changes.mode !== undefined) {
     session.selection.mode = changes.mode === null ? undefined : changes.mode;
+  }
+  if (changes.thinkingOption !== undefined) {
+    session.selection.thinkingOption =
+      changes.thinkingOption === null ? undefined : changes.thinkingOption;
   }
   if (changes.settings) {
     session.settings = { ...session.settings, ...changes.settings };
@@ -490,6 +841,9 @@ async function closeSession(
   state.sessions.delete(input.sessionId);
 
   await session.transcript?.flush();
+  await rm(session.schemaPath, { force: true });
+  await clearAttachments(session.sessionId);
+  await releaseMcpServers(session.sessionId);
   if (process) await process.dispose();
 
   emit({ type: "session.closed", sessionId: input.sessionId });
@@ -511,10 +865,16 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
     {
       cwd: session.config.cwd,
       env: session.config.env,
-      model: session.selection.model,
+      model: resolveThinking(session.selection.model, session.selection.thinkingOption).slug,
       mode: session.selection.mode,
       conversationId: session.conversationId ?? undefined,
+      sandbox: isSettingOn(session.settings.sandbox),
+      addDirs: session.addDirs,
       skipPermissions: approvalPolicy(session) === "skip",
+      outputSchemaPath: session.launchPending.schema ? session.schemaPath : undefined,
+      allowSlashCommands: session.launchPending.commands,
+      attachmentDir: session.attachmentsDir ?? undefined,
+      skillDir: session.launchPending.skillDir ?? undefined,
       extraArgs: session.extraArgs,
       binary: session.agyPath,
     },
@@ -540,6 +900,8 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
   );
 
   session.process = process;
+  // What this launch actually got, so the next prompt can tell whether it needs its own one.
+  session.launchActive = session.launchPending;
   // The tail explains *this* process's failure; leftovers from a previous launch would be quoted
   // as if they came from the run that just died. The same holds for the structured error line.
   session.stderrTail = [];
@@ -608,11 +970,17 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
     const text = turn.assistant.get(step.step_index);
     if (text && text.length > 0) {
       turn.hadAssistantText = true;
-      publish(session, emit, {
-        type: "assistant_message",
-        id: itemId(turn, step.step_index, "msg"),
-        text,
-      });
+      // A schema turn streams nothing to Paseo. Paseo maps every assistant snapshot to a *delta*
+      // appended to its message, so a row streamed now and replaced by the decoded JSON on the
+      // result would show both texts joined; the buffer is published once instead (`handleResult`,
+      // `publishBufferedAnswer`). Tool rows are unaffected: they are not text-merged.
+      if (!turn.schema) {
+        publish(session, emit, {
+          type: "assistant_message",
+          id: itemId(turn, step.step_index, "msg"),
+          text,
+        });
+      }
     }
     return;
   }
@@ -703,8 +1071,24 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
 
   if (result.status === "SUCCESS") {
     const response = result.response ?? "";
-    // Safety net: agy answered without streaming any assistant text.
-    if (!turn.hadAssistantText && response.trim().length > 0) {
+    if (turn.schema) {
+      if (result.structured_output !== undefined) {
+        // The decoded answer is the turn's only assistant row. agy's `response` repeats the same
+        // JSON with `toolAction`/`toolSummary` added, so it must never be published, and the
+        // streamed prose was never published either (see `handleStepUpdate`).
+        const json = JSON.stringify(result.structured_output);
+        publish(session, emit, {
+          type: "assistant_message",
+          id: `agy:schema:${turn.turnId}`,
+          text: json ?? "",
+        });
+      } else {
+        // A schema process that decoded nothing: what it said is published now, or the result's
+        // own text when it streamed none.
+        publishBufferedAnswer(session, emit, turn, response);
+      }
+    } else if (!turn.hadAssistantText && response.trim().length > 0) {
+      // Safety net: agy answered without streaming any assistant text.
       publish(session, emit, {
         type: "assistant_message",
         id: `agy:result:${turn.turnId}`,
@@ -716,6 +1100,7 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
   }
 
   if (isInterrupted(result)) {
+    publishBufferedAnswer(session, emit, turn);
     finalizeToolCalls(session, emit, turn, { status: "canceled" });
     emit({
       type: "session.turn",
@@ -731,6 +1116,7 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     message: result.error ?? `Antigravity reported ${result.status}`,
     code: result.status,
   });
+  publishBufferedAnswer(session, emit, turn);
   finalizeToolCalls(session, emit, turn, { status: "failed", error });
   emit({
     type: "session.turn",
@@ -768,6 +1154,7 @@ function handleAgyExit(
     : turnFailure(session, { message: detail, code: "agy_exit" });
 
   for (const turn of pending) {
+    publishBufferedAnswer(session, emit, turn);
     finalizeToolCalls(
       session,
       emit,
@@ -906,6 +1293,43 @@ function publish(session: Session, emit: Emit, item: ProviderTimelineItem): void
   emit({ type: "timeline.item", sessionId: session.sessionId, item });
 }
 
+/**
+ * Publishes the text a schema turn buffered while streaming none. A plain turn's text is already
+ * on screen, and republishing it would append a second copy under Paseo's delta mapping. `fallback`
+ * is the result's own text, used when the process produced no text at all.
+ */
+function publishBufferedAnswer(
+  session: Session,
+  emit: Emit,
+  turn: PendingTurn,
+  fallback = "",
+): void {
+  if (!turn.schema) return;
+  const buffered = [...turn.assistant.values()].join("");
+  const text = buffered.trim().length > 0 ? buffered : fallback;
+  if (text.trim().length === 0) return;
+  publish(session, emit, {
+    type: "assistant_message",
+    id: `agy:result:${turn.turnId}`,
+    text,
+  });
+}
+
+/** A prompt that never became a turn: nothing was written to agy and no turn id exists yet. */
+function failPrompt(
+  session: Session,
+  emit: Emit,
+  clientMessageId: string,
+  error: ProviderError,
+): void {
+  emit({
+    type: "session.prompt_result",
+    sessionId: session.sessionId,
+    clientMessageId,
+    result: { type: "failed", error },
+  });
+}
+
 function emitNotice(
   session: Session,
   emit: Emit,
@@ -922,12 +1346,16 @@ function emitNotice(
 }
 
 function configState(session: Session): ProviderConfigState {
+  // The tier belongs to the selected model, so the composer's axis is that model's own tiers and
+  // the committed option is the one the next launch will actually pass.
+  const thinking = resolveThinking(session.selection.model, session.selection.thinkingOption);
   return {
     model: session.selection.model,
     mode: session.selection.mode ?? DEFAULT_MODE_ID,
+    thinkingOption: thinking.option,
     models: currentModels(),
     modes: MODES,
-    thinkingOptions: [],
+    thinkingOptions: thinking.options,
     settings: buildSettings(session),
   };
 }
@@ -952,7 +1380,45 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
         { label: "Skip all permissions", value: "skip" },
       ],
     },
+    {
+      type: "select",
+      id: "sandbox",
+      label: "Sandbox",
+      description: "On passes --sandbox, which restricts what terminal commands can reach.",
+      value: onOff(session.settings.sandbox),
+      options: ON_OFF_OPTIONS,
+    },
+    {
+      type: "select",
+      id: "shareMcp",
+      label: "Share Paseo tools with Antigravity",
+      description:
+        Object.keys(session.config.mcpServers).length === 0
+          ? "Paseo has no MCP servers configured for this session, so there is nothing to share."
+          : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config.cwd)} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
+      value: onOff(session.settings.shareMcp),
+      options: ON_OFF_OPTIONS,
+    },
   ];
+}
+
+/**
+ * Paseo draws plugin toggles as icon-only buttons with no on/off state, so a boolean setting is
+ * offered as a two-option select instead: Paseo then shows the current value as a pill. A value
+ * saved while the setting was a toggle (`true`/`false`) still reads correctly.
+ */
+const ON_OFF_OPTIONS = [
+  { label: "Off", value: "off" },
+  { label: "On", value: "on" },
+] as const;
+
+function onOff(value: JsonValue | undefined): "on" | "off" {
+  return isSettingOn(value) ? "on" : "off";
+}
+
+/** `true` and `"on"` are on; everything else — `false`, `"off"`, a missing setting — is off. */
+function isSettingOn(value: JsonValue | undefined): boolean {
+  return value === true || value === "on";
 }
 
 /**
@@ -999,16 +1465,46 @@ function readConversationId(persistence: ProviderPersistence | undefined): strin
 function readProviderOptions(config: ProviderSessionConfig): {
   agyPath?: string;
   extraArgs?: readonly string[];
+  addDirs?: readonly string[];
 } {
   const options = config.providerOptions ?? {};
   const rawPath = options.agyPath;
   const rawArgs = options.extraArgs;
+  const rawDirs = options.addDirs;
   return {
     agyPath: typeof rawPath === "string" && rawPath.trim().length > 0 ? rawPath : undefined,
     extraArgs: Array.isArray(rawArgs)
       ? rawArgs.filter((arg): arg is string => typeof arg === "string")
       : undefined,
+    addDirs: Array.isArray(rawDirs)
+      ? rawDirs.filter((dir): dir is string => typeof dir === "string")
+      : undefined,
   };
+}
+
+/**
+ * `agy` resolves every `--add-dir` against the filesystem at startup, so a path that is not an
+ * absolute existing directory is dropped here, and the session says which ones were left out
+ * instead of failing the launch or letting the model see a directory the user did not intend.
+ */
+async function checkAddDirs(
+  paths: readonly string[] | undefined,
+): Promise<{ kept: string[]; dropped: string[] }> {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const path of paths ?? []) {
+    if (!isAbsolute(path)) {
+      dropped.push(path);
+      continue;
+    }
+    try {
+      if ((await stat(path)).isDirectory()) kept.push(path);
+      else dropped.push(path);
+    } catch {
+      dropped.push(path);
+    }
+  }
+  return { kept, dropped };
 }
 
 /** Antigravity has no system-prompt flag, so it is prepended to the first turn of a conversation. */
@@ -1019,19 +1515,40 @@ function buildOutgoingText(session: Session, text: string): string {
   return `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${text}`;
 }
 
-function renderContent(content: readonly ProviderContent[]): string {
-  return content
-    .map(renderPart)
-    .filter((part) => part.length > 0)
-    .join("\n\n");
+/**
+ * Renders the prompt's parts for agy's text-only stream input. An image part is written to the
+ * session's attachments folder and referenced by absolute path: agy rejects image content blocks
+ * outright, but reads an image file with `view_file` (probed 2026-09-23).
+ */
+async function renderPromptContent(
+  session: Session,
+  content: readonly ProviderContent[],
+): Promise<string> {
+  const parts: string[] = [];
+  for (const part of content) {
+    if (part.type === "image") {
+      if (session.attachmentsDir === null) {
+        throw new Error("the attachments folder could not be created");
+      }
+      session.attachmentCount += 1;
+      const path = await writeAttachment(
+        session.sessionId,
+        session.attachmentCount,
+        part.data,
+        part.mimeType,
+      );
+      parts.push(`[image attached: ${path} — view it with view_file]`);
+      continue;
+    }
+    parts.push(renderPart(part));
+  }
+  return parts.filter((part) => part.length > 0).join("\n\n");
 }
 
-function renderPart(part: ProviderContent): string {
+function renderPart(part: Exclude<ProviderContent, { type: "image" }>): string {
   switch (part.type) {
     case "text":
       return part.text;
-    case "image":
-      return "[an image was omitted: this plugin does not enable Antigravity image input]";
     case "uploaded_file":
       return `[uploaded file: ${part.path}]`;
     case "review":
@@ -1085,6 +1602,7 @@ function describeInput(input: ProviderInput): string {
         `session=${input.sessionId}`,
         `cwd=${input.config.cwd}`,
         `model=${input.config.model ?? "-"}`,
+        `thinkingOption=${input.config.thinkingOption ?? "-"}`,
         `mode=${input.config.mode ?? "-"}`,
         `mcpServers=${Object.keys(input.config.mcpServers).length}`,
         `toolPolicy=${input.config.toolPolicy ? input.config.toolPolicy.preapproved.length : 0}`,
@@ -1093,15 +1611,24 @@ function describeInput(input: ProviderInput): string {
         `systemPrompt=${input.config.systemPrompt?.length ?? 0}chars`,
         `settings=${JSON.stringify(input.config.settings)}`,
       ].join(" ");
-    case "session.prompt":
+    case "session.prompt": {
+      const content = input.prompt.input.type === "message" ? input.prompt.input.content : [];
+      const textChars = content.reduce(
+        (total, part) => total + (part.type === "text" ? part.text.length : 0),
+        0,
+      );
       return [
         "session.prompt",
         `session=${input.sessionId}`,
         `delivery=${input.prompt.delivery}`,
         `kind=${input.prompt.input.type}`,
-        `parts=${input.prompt.input.type === "message" ? input.prompt.input.content.length : 0}`,
-        `text=${input.prompt.input.type === "message" ? renderContent(input.prompt.input.content).length : 0}chars`,
+        ...(input.prompt.input.type === "command" ? [`name=${input.prompt.input.name}`] : []),
+        `parts=${content.length}`,
+        `images=${content.filter((part) => part.type === "image").length}`,
+        `text=${textChars}chars`,
+        `schema=${input.prompt.outputSchema === undefined ? "no" : "yes"}`,
       ].join(" ");
+    }
     case "session.configure":
       return `session.configure session=${input.sessionId} changes=${JSON.stringify(input.changes)}`;
     case "session.interrupt":

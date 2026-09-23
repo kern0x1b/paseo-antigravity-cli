@@ -113,21 +113,51 @@ describe("catalog cache", () => {
 });
 
 describe("buildCatalog", () => {
-  it("uses the models reported by the CLI", async () => {
+  it("groups the tiers the CLI reports into one model with thinking options", async () => {
     process.env.FAKE_MODELS_OK = "1";
     const { buildCatalog } = await import("./catalog");
 
     const catalog = await buildCatalog();
 
+    // Every `<family>-high|medium|low` row becomes one model; the tier suffix becomes the option.
     expect(catalog.models.map((model) => model.id)).toEqual([
-      "gemini-3.8-flash-high",
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.1-pro",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium",
       "fake-model-x",
     ]);
-    expect(catalog.defaultModel).toBe("gemini-3.8-flash-high");
+    expect(catalog.defaultModel).toBe("gemini-3.8-flash");
     expect(catalog.modes.map((mode) => mode.id)).toEqual(["default", "accept-edits", "plan"]);
-    // Effort is expressed through the model id, so there is no separate thinking-option axis.
+    // The axis is per model, so the catalog carries no list of its own.
     expect(catalog.thinkingOptions).toEqual([]);
     expect(catalog.defaultMode).toBe("default");
+
+    const flash = catalog.models.find((model) => model.id === "gemini-3.8-flash");
+    expect(flash).toMatchObject({
+      label: "Gemini 3.8 Flash",
+      isDefault: true,
+      defaultThinkingOptionId: "high",
+      thinkingOptions: [
+        { id: "high", label: "High", isDefault: true },
+        { id: "medium", label: "Medium", isDefault: false },
+        { id: "low", label: "Low", isDefault: false },
+      ],
+    });
+    // A family with two tiers keeps them in `agy models` order; `high` stays the default.
+    expect(catalog.models.find((model) => model.id === "gemini-3.1-pro")).toMatchObject({
+      thinkingOptions: [{ id: "high" }, { id: "low" }],
+      defaultThinkingOptionId: "high",
+    });
+    // A tier suffix with no sibling is part of the id, and a model without one has no tiers.
+    expect(catalog.models.find((model) => model.id === "gpt-oss-120b-medium")).not.toHaveProperty(
+      "thinkingOptions",
+    );
+    const opus = catalog.models.find((model) => model.id === "claude-opus-4-6-thinking");
+    expect(opus).not.toHaveProperty("thinkingOptions");
   });
 
   it("falls back to the bundled list when the CLI cannot list models", async () => {
@@ -135,10 +165,59 @@ describe("buildCatalog", () => {
 
     const catalog = await buildCatalog();
 
-    expect(catalog.models.length).toBeGreaterThan(10);
+    // The bundled list is grouped exactly like a discovered one.
+    expect(catalog.models.map((model) => model.id)).toEqual([
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.1-pro",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium",
+    ]);
     expect(catalog.models.map((model) => model.id)).toContain("claude-opus-4-6-thinking");
     expect(catalog.models.filter((model) => model.isDefault)).toHaveLength(1);
     // The fallback must still expose the modes the composer needs.
     expect(catalog.modes.map((mode) => mode.id)).toContain("plan");
+  });
+});
+
+describe("resolveThinking", () => {
+  it("resolves a tier choice and a persisted full slug to the same slug the CLI accepts", async () => {
+    const { resolveThinking } = await import("./catalog");
+
+    // The family plus an explicit tier.
+    expect(resolveThinking("gemini-3.8-flash", "low")).toMatchObject({
+      slug: "gemini-3.8-flash-low",
+      option: "low",
+    });
+    // No option: the family's default tier.
+    expect(resolveThinking("gemini-3.8-flash", undefined)).toMatchObject({
+      slug: "gemini-3.8-flash-high",
+      option: "high",
+    });
+    // A slug persisted before tiers existed launches unchanged, and reports its own tier.
+    expect(resolveThinking("gemini-3.8-flash-high", undefined)).toMatchObject({
+      slug: "gemini-3.8-flash-high",
+      option: "high",
+    });
+    // A tier chosen afterwards replaces the slug's own tier.
+    expect(resolveThinking("gemini-3.8-flash-high", "medium")).toMatchObject({
+      slug: "gemini-3.8-flash-medium",
+      option: "medium",
+    });
+    // A stale option the model does not have is ignored rather than invented into a slug.
+    expect(resolveThinking("gemini-3.1-pro", "low").slug).toBe("gemini-3.1-pro-low");
+    expect(resolveThinking("gemini-3.1-pro", "medium").slug).toBe("gemini-3.1-pro-high");
+    expect(resolveThinking("claude-sonnet-4-6", "high")).toEqual({
+      slug: "claude-sonnet-4-6",
+      options: [],
+    });
+    // `-medium` here belongs to the id, so no tier may be appended or substituted.
+    expect(resolveThinking("gpt-oss-120b-medium", "high")).toMatchObject({
+      slug: "gpt-oss-120b-medium",
+      options: [],
+    });
+    expect(resolveThinking(undefined, "high")).toEqual({ options: [] });
   });
 });

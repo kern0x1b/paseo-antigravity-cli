@@ -60,6 +60,13 @@ const resultSchema = z.object({
   duration_seconds: z.number().optional(),
   num_turns: z.number().optional(),
   usage: usageSchema.optional(),
+  /**
+   * Present only when the process was launched with `--json-schema`: the model's answer decoded
+   * against that schema. `response` then repeats the same JSON with extra `toolAction` /
+   * `toolSummary` keys, so it is never the answer Paseo should show.
+   */
+  structured_output: z.unknown().optional(),
+  json_schema: z.unknown().optional(),
 });
 
 export type AgyUsage = z.infer<typeof usageSchema>;

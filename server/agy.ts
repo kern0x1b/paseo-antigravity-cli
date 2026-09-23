@@ -13,6 +13,25 @@ export interface AgyLaunchConfig {
   conversationId?: string;
   /** Passes --dangerously-skip-permissions, so every tool runs without approval. */
   skipPermissions: boolean;
+  /** Path to the JSON Schema the turn's answer must match (--json-schema). */
+  outputSchemaPath?: string;
+  /** Extra directory the model may read, used for the plugin's attached images. */
+  attachmentDir?: string;
+  /**
+   * A plugin-expanded skill's own directory, so the turn can read the scripts and templates the
+   * skill's instructions refer to. Set for that one turn's launch, like the schema file.
+   */
+  skillDir?: string;
+  /** Extra directories the user allowed, each its own --add-dir. */
+  addDirs?: readonly string[];
+  /** Passes --sandbox, which restricts what terminal commands may reach. */
+  sandbox?: boolean;
+  /**
+   * Omits `--disable-slash-commands`, so a turn whose text starts with `/<name>` is expanded into
+   * that command. Verified 2026-09-23: without this flag a command never expands, and with it a
+   * plain message that starts with `/` expands too — which is why only a command turn gets one.
+   */
+  allowSlashCommands?: boolean;
   extraArgs?: readonly string[];
   binary?: string;
 }
@@ -44,19 +63,32 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
     "stream-json",
     "--add-dir",
     config.cwd,
-    "--disable-slash-commands",
+    // Antigravity resolves what the model may read against these directories, so the plugin's own
+    // attachments folder follows the workspace one; both are absolute. The user's extra
+    // directories are validated before they reach here.
+    ...(config.attachmentDir ? ["--add-dir", config.attachmentDir] : []),
+    ...(config.skillDir ? ["--add-dir", config.skillDir] : []),
+    ...(config.addDirs ?? []).flatMap((dir) => ["--add-dir", dir]),
+    // A command turn needs expansion; every other turn must keep plain text from starting with
+    // `/` out of the CLI's slash parser (` /skills` and `/tasks` kill a print-mode turn outright).
+    ...(config.allowSlashCommands === true ? [] : ["--disable-slash-commands"]),
     // 0 waits until the turn completes; Paseo owns cancellation instead of a wall clock.
     "--print-timeout",
     "0",
   ];
   // `--effort` is deliberately never passed: Antigravity encodes the reasoning tier in the model
   // id itself (gemini-3.8-flash-high/medium/low) and rejects the pair with
-  // "--model X conflicts with --effort=Y". The tiers are offered as separate models instead.
+  // "--model X conflicts with --effort=Y". The caller resolves the tier the composer chose back
+  // into that slug before launch (`resolveThinking`).
   if (config.model) args.push("--model", config.model);
   // `default` is the implicit mode; agy only accepts accept-edits/plan.
   if (config.mode && config.mode !== "default") args.push("--mode", config.mode);
   if (config.conversationId) args.push("--conversation", config.conversationId);
+  if (config.sandbox) args.push("--sandbox");
   if (config.skipPermissions) args.push("--dangerously-skip-permissions");
+  // Launch-time only: the schema applies to every turn of the process, which is why a schema turn
+  // gets its own launch and the process is replaced again before the next plain turn.
+  if (config.outputSchemaPath) args.push("--json-schema", config.outputSchemaPath);
   if (config.extraArgs) args.push(...config.extraArgs);
   return args;
 }

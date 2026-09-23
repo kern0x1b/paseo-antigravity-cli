@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "files": [
+    "README.md",
     "paseo-plugin.json",
     "icon.svg",
     "index.server.ts",
@@ -14,7 +15,7 @@
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.9.1",
-    "@types/node": "^20.9.0",
+    "@types/node": "^24.13.6",
     "typescript": "^5.9.3",
     "vitest": "^4.1.6",
     "zod": "^4.4.3"

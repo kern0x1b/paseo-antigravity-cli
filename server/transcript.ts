@@ -1,7 +1,8 @@
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
+import { pluginDataDir, unsafePathChars } from "./plugindata";
 
 /**
  * Remembers the timeline rows a conversation produced so `session.open` with `history: "replay"`
@@ -100,9 +101,12 @@ export class TranscriptStore {
 }
 
 function transcriptPath(conversationId: string): string {
-  const home = process.env.PASEO_HOME ?? join(homedir(), ".paseo");
-  const safe = conversationId.replace(/[^A-Za-z0-9._-]/g, "_");
-  return join(home, "plugin-data", "antigravity-cli", "transcripts", `${safe}.jsonl`);
+  return pluginDataDir("transcripts", `${conversationId.replace(unsafePathChars, "_")}.jsonl`);
+}
+
+/** Whether this plugin ever stored a timeline for the conversation. */
+export function transcriptExists(conversationId: string): boolean {
+  return existsSync(transcriptPath(conversationId));
 }
 
 function describe(error: unknown): string {

@@ -4,8 +4,15 @@
  * (see server/protocol.ts and fixtures/) and can be told which scenario to play through env vars.
  *
  *   FAKE_ARGV_FILE       when set, the received argv is written here so tests can assert flags
- *   FAKE_SCENARIO        text (default) | tool | edit | queued | interrupt | error | fail
- *                        | tool-hang | stdin-closed
+ *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
+ *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
+ *                        | fail | tool-hang | stdin-closed | schema | schema-invalid
+ *   FAKE_SCHEMA_OUTPUT   JSON the `schema` scenario returns as structured_output
+ *   FAKE_SCHEMA_GATE     file the `schema` scenario waits for before answering, so a test can act
+ *                        while that turn is still running
+ *   FAKE_SCHEMA_ERROR    text of a failed result the `schema` scenario reports instead of SUCCESS
+ *   FAKE_SCHEMA_STICKY   "1" makes even a flagless process report that structured_output, which
+ *                        is what agy does on a conversation that has used a schema
  *   FAKE_EDIT_FILE       file an `edit` turn rewrites (default <cwd>/hello.txt)
  *   FAKE_EDIT_TOOL       tool an `edit` turn reports (default replace_file_content)
  *   FAKE_EDIT_AFTER      content the edit writes (default "bye world\n")
@@ -21,7 +28,7 @@
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
  *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
  */
-import { appendFileSync, closeSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
@@ -32,13 +39,37 @@ if (process.env.FAKE_ARGV_FILE) {
   writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(argv), "utf8");
 }
 
+// Every launch, in order: a restart test needs to see the flags of each process, not just the last.
+if (process.env.FAKE_ARGV_LOG) {
+  appendFileSync(process.env.FAKE_ARGV_LOG, `${JSON.stringify(argv)}\n`, "utf8");
+}
+
+/** The schema file `--json-schema` points at, when this process was launched with one. */
+const schemaIndex = argv.indexOf("--json-schema");
+const schemaPath = schemaIndex === -1 ? null : argv[schemaIndex + 1];
+
 if (argv[0] === "models") {
   if (process.env.FAKE_MODELS_LOG) {
     appendFileSync(process.env.FAKE_MODELS_LOG, "models\n", "utf8");
   }
   if (process.env.FAKE_MODELS_OK === "1") {
+    // Copied verbatim from `agy models` on Antigravity CLI 1.2.9, plus one model the real CLI
+    // does not have so a test can tell a discovered row from a bundled one.
     process.stdout.write("Fetching available models...\n");
     process.stdout.write("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n");
+    process.stdout.write("gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n");
+    process.stdout.write("gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n");
+    process.stdout.write("gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n");
+    process.stdout.write("gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)\n");
+    process.stdout.write("gemini-3.7-flash-low\tGemini 3.7 Flash (Low)\n");
+    process.stdout.write("gemini-3.6-flash-high\tGemini 3.6 Flash (High)\n");
+    process.stdout.write("gemini-3.6-flash-medium\tGemini 3.6 Flash (Medium)\n");
+    process.stdout.write("gemini-3.6-flash-low\tGemini 3.6 Flash (Low)\n");
+    process.stdout.write("gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n");
+    process.stdout.write("gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n");
+    process.stdout.write("claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n");
+    process.stdout.write("claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n");
+    process.stdout.write("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n");
     process.stdout.write("fake-model-x\tFake Model X\n");
     process.exit(0);
   }
@@ -53,6 +84,19 @@ const scenario = process.env.FAKE_SCENARIO ?? "text";
 const defaultResultError = "Eligibility check failed: the service is currently unavailable.";
 
 const send = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
+
+/**
+ * Sends a terminal result. Antigravity keeps a schema with the *conversation*: a process started
+ * without `--json-schema` still reports that conversation's last structured_output, which is why
+ * the knob applies to results the schema scenario did not build itself (probed 2026-09-23).
+ */
+const sendResult = (result) => {
+  const sticky =
+    process.env.FAKE_SCHEMA_STICKY === "1" && result.structured_output === undefined
+      ? JSON.parse(process.env.FAKE_SCHEMA_OUTPUT ?? '{"color":"blue","count":8}')
+      : undefined;
+  send({ event: "result", result: sticky === undefined ? result : { ...result, structured_output: sticky } });
+};
 
 const usage = {
   input_tokens: Number(process.env.FAKE_RESULT_INPUT_TOKENS ?? 15466),
@@ -75,11 +119,11 @@ let step = 0;
 let turns = 0;
 
 /**
- * Holds the `edit` scenarios until the test lets the change land. Polling a file is the only
- * channel between a test and this process; there is no timing guess and no sleep to speak of.
+ * Holds a scenario until the test lets it continue. Polling a file is the only channel between a
+ * test and this process; there is no timing guess and no sleep to speak of.
  */
-async function waitForGate() {
-  const gate = process.env.FAKE_EDIT_GATE;
+async function waitForGate(variable = "FAKE_EDIT_GATE") {
+  const gate = process.env[variable];
   if (!gate) return;
   const deadline = Date.now() + 10_000;
   while (!existsSync(gate) && Date.now() < deadline) {
@@ -101,16 +145,14 @@ const stepEvent = (stepIndex, state, stepType, extra = {}) => ({
   },
 });
 
-const resultEvent = (numTurns, response, status = "SUCCESS", error) => ({
-  event: "result",
-  result: {
-    conversation_id: conversationId,
-    status,
-    response,
-    ...(error ? { error } : {}),
-    num_turns: numTurns,
-    usage,
-  },
+/** The `result` payload of a turn, as `sendResult` expects it. */
+const turnResult = (numTurns, response, status = "SUCCESS", error) => ({
+  conversation_id: conversationId,
+  status,
+  response,
+  ...(error ? { error } : {}),
+  num_turns: numTurns,
+  usage,
 });
 
 /**
@@ -140,7 +182,7 @@ function playQueued(text) {
       usage: stepUsage,
     }),
   );
-  send(resultEvent(1, `${held.response}\n`));
+  sendResult(turnResult(1, `${held.response}\n`));
 
   send(stepEvent(step, "DONE", "user_input"));
   step += 1;
@@ -153,7 +195,7 @@ function playQueued(text) {
       usage: stepUsage,
     }),
   );
-  send(resultEvent(2, `${response}\n`));
+  sendResult(turnResult(2, `${response}\n`));
 }
 
 // Registered before any output is written, so a consumer that has seen `init` can rely on
@@ -192,15 +234,21 @@ if (stdinGone) {
   createServer().listen(0);
 }
 
-send({
-  event: "init",
-  conversation_id: conversationId,
-  init: {
-    cwd: process.cwd(),
-    tools: ["run_command", "view_file"],
-    permission_mode: "always-proceed",
-  },
-});
+// A CLI that rejects its `--json-schema` never starts a conversation: agy prints the reason and
+// exits 1 with no stdout at all, which is why this scenario emits no init event.
+const schemaRejected = scenario === "schema-invalid";
+
+if (!schemaRejected) {
+  send({
+    event: "init",
+    conversation_id: conversationId,
+    init: {
+      cwd: process.cwd(),
+      tools: ["run_command", "view_file"],
+      permission_mode: "always-proceed",
+    },
+  });
+}
 
 const input = stdinGone ? new PassThrough() : process.stdin;
 readline.createInterface({ input }).on("line", async (line) => {
@@ -232,6 +280,13 @@ readline.createInterface({ input }).on("line", async (line) => {
     process.stderr.write(
       `${process.env.FAKE_STDERR_LINE ?? "error: invalid model selection: model nope is not recognized"}\n`,
     );
+    process.exit(1);
+  }
+
+  if (schemaRejected) {
+    // agy 1.2.9 exits 1 with no stdout when the schema file cannot be read, so the turn must be
+    // failed from the exit path instead of waiting for an answer that is never coming.
+    process.stderr.write("Error: invalid --json-schema: failed to parse schema file\n");
     process.exit(1);
   }
 
@@ -267,7 +322,7 @@ readline.createInterface({ input }).on("line", async (line) => {
       }),
     );
     if (toolEnding === "error") {
-      send(resultEvent(turns, "", "ERROR", process.env.FAKE_RESULT_ERROR ?? defaultResultError));
+      sendResult(turnResult(turns, "", "ERROR", process.env.FAKE_RESULT_ERROR ?? defaultResultError));
     } else if (toolEnding === "die") {
       process.stderr.write("error: the Antigravity service closed the connection\n");
       process.exit(1);
@@ -276,14 +331,55 @@ readline.createInterface({ input }).on("line", async (line) => {
   }
 
   if (scenario === "error") {
+    sendResult({
+      conversation_id: conversationId,
+      status: "ERROR",
+      response: "",
+      error: process.env.FAKE_RESULT_ERROR ?? defaultResultError,
+      duration_seconds: 0,
+      num_turns: turns,
+      usage,
+    });
+    return;
+  }
+
+  if (scenario === "schema" && schemaPath !== null) {
+    // A structured turn as captured in fixtures/10-schema.ndjson: the *streamed* text is the answer
+    // with the CLI's toolAction/toolSummary keys added, `response` repeats it, and the decoded
+    // answer is in `structured_output`. Reading the schema file also proves the provider wrote it.
+    const answer = JSON.parse(process.env.FAKE_SCHEMA_OUTPUT ?? '{"color":"blue","count":8}');
+    let schema;
+    try {
+      schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+    } catch (error) {
+      sendResult(turnResult(turns, "", "ERROR", `invalid --json-schema: ${error.message}`));
+      return;
+    }
+    const streamed = JSON.stringify({
+      ...answer,
+      toolAction: "Finishing task",
+      toolSummary: "Task completion",
+    });
+
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: streamed }));
+    // The gate holds the answer, so a test can act while the schema turn is still running.
+    await waitForGate("FAKE_SCHEMA_GATE");
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "\n", usage: stepUsage }));
+    step += 1;
+
+    if (process.env.FAKE_SCHEMA_ERROR) {
+      sendResult(turnResult(turns, "", "ERROR", process.env.FAKE_SCHEMA_ERROR));
+      return;
+    }
     send({
       event: "result",
       result: {
         conversation_id: conversationId,
-        status: "ERROR",
-        response: "",
-        error: process.env.FAKE_RESULT_ERROR ?? defaultResultError,
-        duration_seconds: 0,
+        status: "SUCCESS",
+        response: `${streamed}\n`,
+        structured_output: answer,
+        json_schema: schema,
+        duration_seconds: 0.2,
         num_turns: turns,
         usage,
       },
@@ -410,15 +506,12 @@ readline.createInterface({ input }).on("line", async (line) => {
       usage: stepUsage,
     },
   });
-  send({
-    event: "result",
-    result: {
-      conversation_id: conversationId,
-      status: "SUCCESS",
-      response: `${response}\n`,
-      duration_seconds: 0.2,
-      num_turns: turns,
-      usage,
-    },
+  sendResult({
+    conversation_id: conversationId,
+    status: "SUCCESS",
+    response: `${response}\n`,
+    duration_seconds: 0.2,
+    num_turns: turns,
+    usage,
   });
 });
