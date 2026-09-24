@@ -20,7 +20,13 @@ import {
   type ProviderToolCallDetail,
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
-import { TranscriptPoller, conversationTranscriptPath, renderBackfill } from "./backfill";
+import {
+  TranscriptPoller,
+  backgroundTasks,
+  conversationTranscriptPath,
+  renderBackfill,
+  stepsPast,
+} from "./backfill";
 import { AgyProcess } from "./agy";
 import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
@@ -237,11 +243,23 @@ interface Session {
   closing: boolean;
   /**
    * A CLI whose last turn was settled from the conversation transcript while its stream was still
-   * held behind a background task (see `backfill.ts`). It is kept alive — the task it holds is
-   * often a dev server the answer just told the user about — but it can never take another turn:
-   * a line written to it would queue behind that task. The next prompt or close disposes it.
+   * held behind a background task (see `backfill.ts`), or that carried on after its turn ended. It
+   * is kept alive — the task it holds is often a dev server the answer just told the user about,
+   * and when a task ends agy carries the conversation on in this same process — but it can never
+   * take another turn: a line written to it would queue behind that task, and its stream now owes
+   * results no turn of this plugin's is waiting for. The next prompt or close disposes it, unless
+   * it is in the middle of carrying on (see `continuation`).
    */
   detached: AgyProcess | null;
+  /** The transcript follow of the detached CLI, while it lives. */
+  continuation: Continuation | null;
+  /**
+   * Turns announced while the detached CLI was carrying the conversation on. They are written to a
+   * fresh CLI once that continuation settles: killing the CLI mid-way would lose what it was doing.
+   */
+  deferred: PendingTurn[];
+  /** The highest step a settled turn accounted for; a later step nobody prompted is a continuation. */
+  settledStep: number;
   /** The plan a plan-mode turn ended with, while the user has not approved or dismissed it. */
   pendingPlan: { id: string; text: string } | null;
   /** Whether the host negotiated `permission`, without which a plan cannot be offered. */
@@ -302,6 +320,21 @@ interface PendingTurn {
   outgoing: string;
   /** Sent in plan mode, so its answer is offered as a plan to implement. */
   plan: boolean;
+}
+
+/**
+ * Follows the conversation of a detached CLI. When a background task ends, agy tells the model in
+ * a SYSTEM_MESSAGE and the model carries on in the same process — for dozens of steps, pushing code
+ * and writing a new answer (seen in a real conversation: 64 steps after a long test run finished).
+ * The detached stream is never read, so the transcript is the only place those steps appear; each
+ * run of them is published as a turn the plugin opens itself, settled at its final answer.
+ */
+interface Continuation {
+  readonly poller: TranscriptPoller;
+  /** Every step up to here is already published under some turn. */
+  settledStep: number;
+  /** The plugin-initiated turn publishing the steps past `settledStep`, while one is open. */
+  turn: PendingTurn | null;
 }
 
 /** The fields of a tool row, kept so a call left open can be republished with a terminal status. */
@@ -439,6 +472,7 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
         if (session.detached) running.push(session.detached);
         session.process = null;
         session.detached = null;
+        stopContinuation(session);
         for (const turn of session.pendingTurns) stopBackfill(turn);
         if (session.transcript) flushing.push(session.transcript.flush());
         // A child is followed by a watcher and a timer of its own, and its rows live in a store of
@@ -575,6 +609,9 @@ async function openSession(
     interrupting: false,
     closing: false,
     detached: null,
+    continuation: null,
+    deferred: [],
+    settledStep: -1,
     pendingPlan: null,
     planApproval: state.capabilities.includes("permission"),
   };
@@ -1036,17 +1073,16 @@ interface TurnRequest {
   verbatim: boolean;
 }
 
-async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
+function createPendingTurn(session: Session, plan: boolean): PendingTurn {
   session.turnCounter += 1;
-  const plan = session.selection.mode === PLAN_MODE_ID && !request.verbatim;
-  const turn: PendingTurn = {
+  return {
     turnId: `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`,
     assistant: new Map(),
     tools: new Map(),
     snapshots: new Map(),
     hadAssistantText: false,
-    // Replaced below with the launch profile of the process that actually serves the turn: a turn
-    // queued behind another is answered by that process, not by the one its own prompt implies.
+    // Replaced with the launch profile of the process that actually serves the turn: a turn queued
+    // behind another is answered by that process, not by the one its own prompt implies.
     schema: false,
     lastStreamStep: -1,
     backfilled: new Map(),
@@ -1055,6 +1091,11 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
     outgoing: "",
     plan,
   };
+}
+
+async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
+  const plan = session.selection.mode === PLAN_MODE_ID && !request.verbatim;
+  const turn = createPendingTurn(session, plan);
 
   publish(session, emit, {
     type: "user_message",
@@ -1078,6 +1119,13 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
   } else {
     turn.outgoing = buildOutgoingText(session, plan ? `${PLAN_MODE_PREAMBLE}\n\n${request.text}` : request.text);
     session.systemPromptSent = true;
+  }
+  // The detached CLI is carrying the conversation on, and the only way to hand this turn to a CLI
+  // would be to kill that one mid-way. The turn is announced now and written once it settles.
+  if (isContinuing(session) || session.deferred.length > 0) {
+    console.log(`[antigravity] ${turn.turnId} waits for the conversation to finish carrying on`);
+    session.deferred.push(turn);
+    return;
   }
   await writePendingTurn(session, emit, turn);
 }
@@ -1110,7 +1158,8 @@ async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn)
  * still owes has finished.
  */
 function queuedRefusal(session: Session, profile: LaunchProfile): string | null {
-  if (session.pendingTurns.length === 0) return null;
+  const deferring = isContinuing(session) || session.deferred.length > 0;
+  if (session.pendingTurns.length === 0 && !deferring) return null;
   if (profile.schema) {
     return "Antigravity applies a structured-output schema to the whole process, so this prompt cannot be queued behind a running turn. Wait for the turn to finish and send it again.";
   }
@@ -1120,6 +1169,8 @@ function queuedRefusal(session: Session, profile: LaunchProfile): string | null 
   if (profile.skillDir !== null) {
     return "This skill is expanded by the plugin, which gives the CLI the skill's own directory for that turn alone, and the CLI cannot be replaced while it is still answering. Wait for the turn to finish and send the command again.";
   }
+  // A deferred turn is written to a CLI launched for it, so the detached one's flags do not apply.
+  if (session.pendingTurns.length === 0) return null;
   if (session.launchActive.schema) {
     return "Antigravity is answering a structured-output request, and applies its schema to every turn of that process. Wait for the turn to finish and send this again.";
   }
@@ -1138,7 +1189,9 @@ async function interruptSession(
   emit: Emit,
 ): Promise<void> {
   const session = requireSession(state, input.sessionId);
-  const process = session.process;
+  // A continuation is the detached CLI's turn, so stopping it stops that CLI; its exit settles the
+  // continuation and the turns deferred behind it (see `handleDetachedExit`).
+  const process = session.process ?? (isContinuing(session) ? session.detached : null);
   if (process?.running) {
     session.interrupting = true;
     try {
@@ -1198,12 +1251,21 @@ async function applyPendingRestart(session: Session): Promise<void> {
   await process.dispose();
 }
 
-/** Disposes the CLI left holding a background task, so a fresh one serves the next turn. */
+/**
+ * Disposes the CLI left holding a background task, so a fresh one serves the next turn. One that is
+ * carrying the conversation on is left alone: the turn that would replace it waits instead.
+ *
+ * An idle detached CLI is replaced rather than given the turn. Its stream still owes the `result`
+ * of the turn that was settled from the transcript, plus whatever it reports for the steps it took
+ * on its own — how many results that is was never observed — and every result is matched to the
+ * oldest pending turn, so a turn written to it could be settled by an answer that is not its own.
+ */
 async function releaseDetached(session: Session): Promise<void> {
   const detached = session.detached;
-  if (!detached) return;
+  if (!detached || isContinuing(session)) return;
+  stopContinuation(session);
   session.detached = null;
-  console.log("[antigravity] stopping the CLI that was still holding a background task");
+  console.log("[antigravity] stopping the detached CLI so a fresh one serves the next turn");
   await detached.dispose();
 }
 
@@ -1262,7 +1324,20 @@ function applyBackfill(
     },
     session.config.cwd,
   );
-  for (const { stepIndex, item } of render.rows) {
+  publishTranscriptRows(session, emit, turn, render.rows);
+  if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
+    settleFromTranscript(session, turn, emit, render.finalStep);
+  }
+}
+
+/** Publishes the transcript's rows a turn does not have yet, and tracks them as that turn's. */
+function publishTranscriptRows(
+  session: Session,
+  emit: Emit,
+  turn: PendingTurn,
+  rows: ReturnType<typeof renderBackfill>["rows"],
+): void {
+  for (const { stepIndex, item } of rows) {
     if (stepIndex <= turn.lastStreamStep && !turn.backfilled.has(stepIndex)) continue;
     const json = JSON.stringify(item);
     if (turn.backfilled.get(stepIndex) === json) continue;
@@ -1285,18 +1360,26 @@ function applyBackfill(
     }
     publish(session, emit, item);
   }
-  if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
-    settleFromTranscript(session, turn, emit);
-  }
 }
 
 /**
  * Completes a turn whose answer only the transcript has. The CLI serving it still owes that turn's
  * `result`, and will not read another line until its background task ends, so it is detached:
  * nothing it prints is used any more, and a fresh CLI resumes the conversation for the next turn.
+ *
+ * The answer is provisional. A text-only step is often "the tests are running, I'll wait", and once
+ * the task ends the model carries on in the detached CLI; the transcript keeps being followed for
+ * that (see `Continuation`). Holding the turn open until its tasks end instead would leave it
+ * running for good whenever the task is a dev server, which is what detaching was for.
  */
-function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): void {
+function settleFromTranscript(
+  session: Session,
+  turn: PendingTurn,
+  emit: Emit,
+  finalStep: number,
+): void {
   stopBackfill(turn);
+  session.settledStep = Math.max(session.settledStep, finalStep);
   const queued = session.pendingTurns.filter((pending) => pending !== turn);
   session.pendingTurns = [];
   console.log(
@@ -1308,17 +1391,14 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): 
 
   const stuck = session.process;
   session.process = null;
-  if (stuck) {
-    if (session.detached) void session.detached.dispose();
-    session.detached = stuck;
-  }
+  if (stuck) detachProcess(session, emit, stuck);
   emitNotice(
     session,
     emit,
     "agy-background-task",
     "info",
     "A background command is still running",
-    "Antigravity left a command running in the background (for example a dev server) after its answer. It keeps running until your next message, which resumes this conversation in a fresh Antigravity CLI and stops it.",
+    "Antigravity left a command running in the background (for example a dev server) after its answer. If it finishes first, Antigravity may carry on with the conversation, and what it does is shown here as its own turn. Otherwise it keeps running until your next message, which resumes this conversation in a fresh Antigravity CLI and stops it.",
   );
   // Turns written behind the settled one were queued inside the detached CLI and would never run
   // there, so they go to the fresh one instead. Their `started` was already announced.
@@ -1328,6 +1408,141 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): 
 async function resendQueued(session: Session, emit: Emit, queued: readonly PendingTurn[]): Promise<void> {
   await releaseDetached(session);
   for (const turn of queued) await writePendingTurn(session, emit, turn);
+}
+
+/** Whether the detached CLI is in the middle of carrying the conversation on. */
+function isContinuing(session: Session): boolean {
+  return session.continuation?.turn != null;
+}
+
+/**
+ * Takes a CLI off the session — its stream is no longer read — and follows the conversation it
+ * holds from the transcript for as long as it lives.
+ */
+function detachProcess(session: Session, emit: Emit, process: AgyProcess): void {
+  stopContinuation(session);
+  if (session.detached) void session.detached.dispose();
+  session.detached = process;
+  const conversationId = session.conversationId;
+  if (conversationId === null || session.closing) return;
+  const continuation: Continuation = {
+    poller: new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
+      applyContinuation(session, emit, continuation, entries),
+    ),
+    settledStep: session.settledStep,
+    turn: null,
+  };
+  session.continuation = continuation;
+  continuation.poller.start();
+}
+
+/** Stops following the detached CLI's conversation. An open continuation is settled by the caller. */
+function stopContinuation(session: Session): void {
+  session.continuation?.poller.stop();
+  session.continuation = null;
+}
+
+/**
+ * Publishes the steps the detached CLI took since the last settled one. The first of them opens a
+ * turn of the plugin's own — usually the SYSTEM_MESSAGE announcing a finished task, written the same
+ * second as the model's first step after it — and the final answer settles it.
+ */
+function applyContinuation(
+  session: Session,
+  emit: Emit,
+  continuation: Continuation,
+  entries: Parameters<typeof renderBackfill>[0],
+): void {
+  if (session.closing || session.continuation !== continuation) return;
+  const past = stepsPast(entries, continuation.settledStep);
+  if (past.length === 0) return;
+
+  let turn = continuation.turn;
+  if (turn === null) {
+    turn = createPendingTurn(session, false);
+    continuation.turn = turn;
+    console.log(
+      `[antigravity] the conversation carried on after step ${continuation.settledStep}; publishing it as ${turn.turnId}`,
+    );
+    emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
+  }
+  const render = renderBackfill(
+    past,
+    {
+      message: (stepIndex) => itemId(turn, stepIndex, "msg"),
+      tool: (stepIndex) => itemId(turn, stepIndex, "tool"),
+    },
+    session.config.cwd,
+  );
+  publishTranscriptRows(session, emit, turn, render.rows);
+  if (render.finalStep === null || !turn.backfilled.has(render.finalStep)) return;
+
+  // As provisional as any answer settled from the transcript: another task may end and wake the
+  // model again, which opens the next continuation from here.
+  continuation.turn = null;
+  continuation.settledStep = render.finalStep;
+  session.settledStep = Math.max(session.settledStep, render.finalStep);
+  finalizeToolCalls(session, emit, turn, { status: "completed" });
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+
+  if (session.deferred.length > 0) {
+    void sendDeferred(session, emit);
+    return;
+  }
+  // Every task this conversation started has reported its end and no subagent is still running,
+  // so nothing is left that could wake the CLI: it is released now rather than followed until the
+  // next prompt. Tasks are only counted when some were seen, so a notice worded differently from
+  // the captured one keeps the CLI followed instead of cutting a continuation short.
+  const tasks = backgroundTasks(entries, continuation.settledStep);
+  const childRunning = [...session.follows.values()].some((follow) => !follow.done);
+  if (tasks.started > 0 && tasks.open.size === 0 && !childRunning) {
+    void releaseDetached(session);
+  }
+}
+
+/** Writes the turns deferred behind a continuation to a fresh CLI, in the order they were sent. */
+async function sendDeferred(session: Session, emit: Emit): Promise<void> {
+  await releaseDetached(session);
+  // A prompt that arrives while this runs joins the queue, so it cannot overtake the ones before it.
+  while (session.deferred.length > 0 && !session.closing) {
+    const turn = session.deferred.shift();
+    if (turn) await writePendingTurn(session, emit, turn);
+  }
+}
+
+/**
+ * The detached CLI is gone. A continuation it was in the middle of ends with it; the turns deferred
+ * behind it are sent to a fresh CLI, unless the exit was the user stopping the continuation, which
+ * stops what was queued behind it too, as it does for turns queued inside a running CLI.
+ */
+function handleDetachedExit(session: Session, emit: Emit): void {
+  session.detached = null;
+  const turn = session.continuation?.turn ?? null;
+  stopContinuation(session);
+  if (session.closing) return;
+  const canceled = session.interrupting;
+  const error: ProviderError = canceled
+    ? { message: "Interrupted", code: "interrupted" }
+    : { message: "Antigravity exited while it was carrying on with the conversation", code: "agy_exit" };
+  if (turn) {
+    finalizeToolCalls(session, emit, turn, canceled ? { status: "canceled" } : { status: "failed", error });
+    emit({
+      type: "session.turn",
+      sessionId: session.sessionId,
+      turnId: turn.turnId,
+      state: canceled ? "canceled" : "failed",
+      error,
+    });
+  }
+  if (!canceled) {
+    if (session.deferred.length > 0) void sendDeferred(session, emit);
+    return;
+  }
+  const deferred = session.deferred;
+  session.deferred = [];
+  for (const pending of deferred) {
+    emit({ type: "session.turn", sessionId: session.sessionId, turnId: pending.turnId, state: "canceled", error });
+  }
 }
 
 /** The turn's last assistant text: what a plan-mode turn offers as its plan. */
@@ -1412,6 +1627,8 @@ async function closeSession(
   session.process = null;
   const detached = session.detached;
   session.detached = null;
+  stopContinuation(session);
+  session.deferred = [];
   for (const turn of session.pendingTurns) stopBackfill(turn);
   state.sessions.delete(input.sessionId);
 
@@ -1488,6 +1705,10 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
         console.error(`[antigravity] ${line}`);
       },
       onExit: (info) => {
+        if (session.detached === process) {
+          handleDetachedExit(session, emit);
+          return;
+        }
         if (session.process !== process) return;
         handleAgyExit(session, info, emit);
       },

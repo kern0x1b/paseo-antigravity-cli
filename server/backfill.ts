@@ -120,14 +120,64 @@ export function renderBackfill(
   };
 }
 
-/** Poll period while a stream is stuck. */
+const USER_INPUT = "USER_INPUT";
+
+/**
+ * The steps past `settledStep` that nobody prompted: what the agent did on its own after a turn
+ * ended, up to (not including) the next USER_INPUT, whose steps belong to that prompt's turn.
+ */
+export function stepsPast(entries: readonly TranscriptEntry[], settledStep: number): TranscriptEntry[] {
+  const sorted = entries
+    .filter((entry) => entry.stepIndex > settledStep)
+    .sort((left, right) => left.stepIndex - right.stepIndex);
+  const prompted = sorted.findIndex((entry) => entry.type === USER_INPUT);
+  return prompted === -1 ? sorted : sorted.slice(0, prompted);
+}
+
+/**
+ * Background tasks the conversation started since the last prompt at or before `settledStep`, and
+ * those of them no notice has reported ended yet. Captured with agy 1.2.10: the call's GENERIC
+ * result reads `Tool is running as a background task with task id: <conversation>/task-54`, and the
+ * end arrives as a SYSTEM_MESSAGE carrying `Task id "<conversation>/task-54" finished with result:`.
+ * Only `finished` was observed; the other endings are matched so a canceled task is not waited on.
+ */
+export function backgroundTasks(
+  entries: readonly TranscriptEntry[],
+  settledStep: number,
+): { started: number; open: Set<string> } {
+  let since = -1;
+  for (const entry of entries) {
+    if (entry.type === USER_INPUT && entry.stepIndex <= settledStep) since = Math.max(since, entry.stepIndex);
+  }
+  const sorted = entries
+    .filter((entry) => entry.stepIndex > since)
+    .sort((left, right) => left.stepIndex - right.stepIndex);
+  const open = new Set<string>();
+  let started = 0;
+  for (const entry of sorted) {
+    const content = entry.content ?? "";
+    const start = TASK_STARTED.exec(content);
+    if (entry.type === GENERIC && start?.[1]) {
+      started += 1;
+      open.add(start[1]);
+    }
+    for (const end of content.matchAll(TASK_ENDED)) if (end[1]) open.delete(end[1]);
+  }
+  return { started, open };
+}
+
+const TASK_STARTED = /running as a background task with task id: (\S+)/;
+const TASK_ENDED = /Task id "?([^"\s]+?)"? (?:finished|completed|canceled|cancelled|failed|terminated)\b/g;
+
+/** Poll period while a stream is stuck, or while a conversation may carry on after its turn. */
 const POLL_MS = 1_000;
 /** A transcript larger than this is not re-read on every tick. */
 const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 
 /**
- * Re-reads one conversation transcript whenever it changes and hands its entries on. Started only
- * while a turn has a tool that has not reported back, and stopped with that turn.
+ * Re-reads one conversation transcript whenever it changes and hands its entries on. Started while
+ * a turn has a tool that has not reported back, and stopped with that turn; or after a turn that
+ * left its CLI detached, and stopped with that CLI.
  */
 export class TranscriptPoller {
   private timer: NodeJS.Timeout | null = null;
@@ -142,7 +192,9 @@ export class TranscriptPoller {
 
   start(): void {
     if (this.stopped || this.timer) return;
-    this.timer = setInterval(() => void this.tick(), POLL_MS);
+    // The tests shorten the period; nothing else sets this.
+    const period = Number(process.env.PASEO_ANTIGRAVITY_POLL_MS) || POLL_MS;
+    this.timer = setInterval(() => void this.tick(), period);
     this.timer.unref();
     void this.tick();
   }
