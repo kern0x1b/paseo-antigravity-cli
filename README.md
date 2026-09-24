@@ -20,7 +20,7 @@ paseo plugin install npm:paseo-plugin-antigravity-cli
 Or from GitHub:
 
 ```
-paseo plugin install github:lefos13/paseo-plugin-antigravity-cli
+paseo plugin install github:kern0x1b/paseo-antigravity-cli
 ```
 
 You can also paste either source into **Settings → Plugins → Plugin source**. Check it with

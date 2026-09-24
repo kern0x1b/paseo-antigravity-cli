@@ -27,11 +27,11 @@
   "author": "lefos13",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lefos13/paseo-plugin-antigravity-cli.git"
+    "url": "git+https://github.com/kern0x1b/paseo-antigravity-cli.git"
   },
-  "homepage": "https://github.com/lefos13/paseo-plugin-antigravity-cli#readme",
+  "homepage": "https://github.com/kern0x1b/paseo-antigravity-cli#readme",
   "bugs": {
-    "url": "https://github.com/lefos13/paseo-plugin-antigravity-cli/issues"
+    "url": "https://github.com/kern0x1b/paseo-antigravity-cli/issues"
   },
   "keywords": [
     "paseo",
