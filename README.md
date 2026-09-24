@@ -60,6 +60,7 @@ The first one that resolves, in this order:
 | `session.list` | Imports existing Antigravity conversations by reading `~/.gemini/antigravity-cli/conversation_summaries.db` read-only. Filter by workspace, text, and limit; subagent runs are excluded. |
 | `session.persistence` | The conversation id agy reports is persisted, so reopening an agent resumes the same Antigravity conversation. |
 | `session.subsession` | Each subagent an `invoke_subagent` call starts is shown as a child session of the agent that spawned it, linked to its row, and follows the child's own transcript live (see [Subagents](#subagents)). |
+| `permission` | Used only for plan approval: a plan-mode turn ends with an *Implement this plan?* prompt (see [Plan mode](#plan-mode)). agy's own tool approvals cannot be surfaced. |
 | `permission.tool_policy` | Accepted (Paseo rejects a session carrying a tool policy otherwise), but preapproved MCP tools cannot be forwarded: agy reads its own rules from `settings.json`. |
 
 Models come from `agy models` (cached for 10 minutes against the resolved binary's path and
@@ -73,6 +74,35 @@ Tool rows are mapped from the CLI's own step parameters: shell commands, file re
 edits (with a unified diff), `grep_search`/`find_by_name`/`list_dir`, `search_web`,
 `read_url_content`, `define_subagent`, and `call_mcp_tool` (shown as `server/tool`). Subagents
 get their own rows, below.
+
+### Plan mode
+
+`agy --mode plan` does not stop a headless run from editing: agy 1.1.28+ approves its own plan
+review when nobody can answer it, and on CLI 1.2.10 a `--mode plan` run edited files straight away,
+with and without `--dangerously-skip-permissions` (probed 2026-09-24). The plugin therefore enforces
+plan mode itself:
+
+- every plan-mode turn is prefixed with a `<plan_mode>` block telling the model to investigate
+  read-only and end with an implementation plan instead of implementing it;
+- when the turn completes, its last answer is offered as a plan (`kind: "plan"` permission) with
+  **Implement** and **Keep planning**. *Implement* switches the session to *Accept edits* and sends
+  `The plan is approved. Implement it now.`; *Keep planning*, or simply sending another message,
+  withdraws the prompt and stays in plan mode.
+
+This is an instruction, not a sandbox: agy has no headless flag that denies edits, so a model that
+ignores the instruction can still write files.
+
+### Background commands
+
+When the model starts a long-running command in the background (a dev server, a watcher), agy
+keeps that tool `ACTIVE` on the stream until the command exits and holds back every later step and
+the turn's `result` behind it — the conversation itself carries on and finishes (CLI 1.2.10). A
+tool still running after 5 s therefore makes the plugin read the conversation's own transcript
+(`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl`), publish
+the steps the stream is holding, and complete the turn as soon as the transcript shows the final
+answer. The CLI holding the command is left running, so the server stays up; a notice says so.
+It cannot take another turn (a line written to it would queue behind the command), so your next
+message stops it — and the command with it — and resumes the conversation in a fresh CLI.
 
 ## Subagents
 
@@ -152,9 +182,9 @@ reason: the CLI cannot be replaced until the turn it owes has finished.
 - **Steering** (`prompt.steer`): a line written to agy's stdin while a turn is running is *queued
   into a following turn*, not applied to the running one. There is no way to steer, so Paseo
   replaces the active turn instead of offering it.
-- **Permission prompts** (`permission`): agy resolves tool approval internally through its own
+- **Tool permission prompts**: agy resolves tool approval internally through its own
   `toolPermission` setting and cannot surface a request over `stream-json`. Choose the approval
-  behaviour in the session settings instead.
+  behaviour in the session settings instead. (`permission` is negotiated only for plan approval.)
 - **Rewind** (`session.revert.*`): Antigravity's `/rewind` is interactive-only; nothing in
   `stream-json` exposes it.
 - **Shared-installer skills are expanded by the plugin, not the CLI.** `~/.agents/skills/<name>/SKILL.md`

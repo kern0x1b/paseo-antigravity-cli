@@ -43,6 +43,7 @@ const OFFERED = [
   "session.configure",
   "session.list",
   "session.persistence",
+  "permission",
   "permission.tool_policy",
 ];
 
@@ -140,6 +141,8 @@ afterEach(async () => {
     "FAKE_EDIT_AFTER",
     "FAKE_EDIT_GATE",
     "FAKE_EDIT_SKIP_WRITE",
+    "FAKE_BACKGROUND_GATE",
+    "PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS",
   ]) {
     delete process.env[key];
   }
@@ -2997,3 +3000,146 @@ describe("subagents", () => {
   });
 });
 
+
+describe("background commands", () => {
+  function heldTurn(): void {
+    process.env.FAKE_SCENARIO = "background";
+    process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
+    process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+  }
+
+  it("completes a turn from the transcript while a background command holds the stream", async () => {
+    heldTurn();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    expect([...paseoView(events).messages.values()]).toEqual([
+      "Starting the server.",
+      "The server is running (start it).",
+    ]);
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    const last = new Map(calls.map((item) => [item.id, item]));
+    expect([...last.values()].map((item) => [item.detail.type === "shell" && item.detail.command, item.status])).toEqual([
+      ["npm start", "completed"],
+      ["curl -s localhost:4719/health", "completed"],
+    ]);
+    expect(
+      events.filter((event) => event.type === "session.notice" && event.notice.id === "agy-background-task"),
+    ).toHaveLength(1);
+
+    // The task ends and the held CLI prints everything it owed: none of it may be shown twice.
+    const settled = paseoView(events).messages;
+    const count = events.length;
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    // A real delay: what is asserted is that the detached CLI's late output produces *no* event,
+    // and there is no signal to await for something that must not happen.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(events.slice(count).filter((event) => event.type !== "session.notice")).toEqual([]);
+    expect(paseoView(events).messages).toEqual(settled);
+  });
+
+  it("resumes the conversation in a fresh CLI for the next prompt", async () => {
+    heldTurn();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "next", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the next turn to complete");
+
+    expect(paseoView(events).finalText).toBe("echo:next\n");
+    const launches = readArgvLog();
+    expect(launches).toHaveLength(2);
+    expect(launches[1]).toContain("--conversation");
+  });
+});
+
+describe("plan mode", () => {
+  function permissions(events: ProviderEvent[]) {
+    return events.flatMap((event) => (event.type === "session.permission" ? [event.request] : []));
+  }
+  function resolved(events: ProviderEvent[]): string[] {
+    return events.flatMap((event) => (event.type === "session.permission_resolved" ? [event.permissionId] : []));
+  }
+
+  it("tells the model to plan and offers its answer as a plan to implement", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "plan" });
+    await prompt(connection, "add a cache");
+    await waitFor(() => permissions(events)[0], "the plan prompt");
+
+    expect(readPrompts()[0]).toMatch(/^<plan_mode>[\s\S]*Do not implement the plan[\s\S]*<\/plan_mode>\n\nadd a cache$/);
+    expect(permissions(events)[0]).toMatchObject({
+      kind: "plan",
+      detail: expect.objectContaining({ type: "plan" }),
+      actions: [
+        expect.objectContaining({ id: "implement", behavior: "allow", intent: "implement" }),
+        expect.objectContaining({ id: "dismiss", behavior: "deny", intent: "dismiss" }),
+      ],
+    });
+    const request = permissions(events)[0];
+    expect(request?.detail?.type === "plan" && request.detail.text).toContain("echo:");
+  });
+
+  it("implements an approved plan in accept-edits mode", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "plan" });
+    await prompt(connection, "add a cache");
+    const request = await waitFor(() => permissions(events)[0], "the plan prompt");
+
+    await connection.send({
+      type: "session.permission",
+      sessionId: "session-1",
+      permissionId: request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+    await waitFor(() => turns(events, "completed")[1], "the implementing turn to complete");
+
+    expect(resolved(events)).toEqual([request.id]);
+    const configs = events.flatMap((event) => (event.type === "session.config" ? [event.config.mode] : []));
+    expect(configs.at(-1)).toBe("accept-edits");
+    expect(readPrompts()[1]).toBe("The plan is approved. Implement it now.");
+    const launches = readArgvLog();
+    expect(launches.at(-1)).toEqual(expect.arrayContaining(["--mode", "accept-edits", "--conversation"]));
+    // The implementing turn is no plan, so it asks for nothing.
+    expect(permissions(events)).toHaveLength(1);
+  });
+
+  it("keeps planning when the plan is dismissed or a new message is sent instead", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "plan" });
+    await prompt(connection, "add a cache");
+    const first = await waitFor(() => permissions(events)[0], "the first plan prompt");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "session-1",
+      permissionId: first.id,
+      response: { behavior: "deny", selectedActionId: "dismiss" },
+    });
+    expect(resolved(events)).toEqual([first.id]);
+    expect(turns(events, "started")).toHaveLength(1);
+
+    await prompt(connection, "use redis instead", "m2");
+    const second = await waitFor(() => permissions(events)[1], "the second plan prompt");
+    await prompt(connection, "actually, in memory", "m3");
+    await waitFor(() => turns(events, "completed")[2], "the third turn to complete");
+    expect(resolved(events)).toEqual([first.id, second.id]);
+    expect(readPrompts().every((text) => text.startsWith("<plan_mode>"))).toBe(true);
+  });
+
+  it("asks nothing outside plan mode", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "accept-edits" });
+    await prompt(connection, "add a cache");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    expect(permissions(events)).toEqual([]);
+    expect(readPrompts()[0]).toBe("add a cache");
+  });
+});

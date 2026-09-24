@@ -538,6 +538,39 @@ readline.createInterface({ input }).on("line", async (line) => {
     return;
   }
 
+  if (scenario === "background") {
+    // A command agy moved to the background (captured with agy 1.2.10 on a `npm run demo` dev
+    // server): the stream stops at that tool's ACTIVE line while the conversation carries on and
+    // finishes in its own transcript. Everything after it — and the result — is held until the
+    // task ends, which here is when the test writes FAKE_BACKGROUND_GATE.
+    const first = step;
+    step += 5;
+    const command = { CommandLine: "npm start" };
+    send(stepEvent(first, "DONE", "agent_response", { text_delta: "Starting the server." }));
+    send(stepEvent(first + 1, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command } }));
+
+    const encode = (value) => JSON.stringify(value);
+    const transcript = [
+      { step_index: first - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` },
+      { step_index: first, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] },
+      { step_index: first + 1, source: "MODEL", type: "GENERIC", status: "DONE", content: "Tool is running as a background task with task id: task-1" },
+      { step_index: first + 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command", args: { CommandLine: encode("curl -s localhost:4719/health") } }] },
+      { step_index: first + 3, source: "MODEL", type: "GENERIC", status: "DONE", content: "The command exited with code 0.\nOutput:\nok" },
+      { step_index: first + 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `The server is running (${text}).` },
+    ];
+    const path = join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+    await writeChildLines(path, transcript.map((line) => JSON.stringify(line)));
+
+    await waitForGate("FAKE_BACKGROUND_GATE");
+    send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "started" } }));
+    send(stepEvent(first + 2, "DONE", "agent_response", {}));
+    send(stepEvent(first + 3, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "curl -s localhost:4719/health" } } }));
+    send(stepEvent(first + 3, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "curl -s localhost:4719/health" }, output: "ok" } }));
+    send(stepEvent(first + 4, "DONE", "agent_response", { text_delta: `The server is running (${text}).` }));
+    sendResult(turnResult(turns, `The server is running (${text}).`));
+    return;
+  }
+
   if (scenario === "error") {
     sendResult({
       conversation_id: conversationId,

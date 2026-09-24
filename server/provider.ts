@@ -20,6 +20,7 @@ import {
   type ProviderToolCallDetail,
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
+import { TranscriptPoller, conversationTranscriptPath, renderBackfill } from "./backfill";
 import { AgyProcess } from "./agy";
 import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
@@ -66,6 +67,27 @@ const PROVIDER_ID = "antigravity-cli";
 const STDERR_TAIL = 20;
 /** Whole files remembered per session for diffing, newest last. */
 const OBSERVED_LIMIT = 32;
+/**
+ * How long a tool may stay ACTIVE before the conversation transcript is consulted. A command agy
+ * moved to the background holds every later stream line until it ends (see `backfill.ts`).
+ */
+const BACKFILL_DELAY_MS = 5_000;
+
+const PLAN_MODE_ID = "plan";
+/** The mode an approved plan is implemented in. */
+const IMPLEMENT_MODE_ID = "accept-edits";
+/**
+ * `--mode plan` changes nothing in a headless run: agy 1.1.28+ approves its own plan review when
+ * no one can answer it, and a plan-mode run on agy 1.2.10 edited files straight away, with and
+ * without --dangerously-skip-permissions (probed 2026-09-24). So plan mode is the plugin's to
+ * enforce: every plan-mode turn carries this preamble, and its answer is offered as a plan.
+ */
+const PLAN_MODE_PREAMBLE = `<plan_mode>
+Plan mode is on. Do not create, edit, move or delete any file, and do not run commands that change anything: no installs, builds that write output, git commits, servers or other side effects. Read-only investigation — reading files, searching, and read-only commands — is allowed.
+End your turn with a concrete implementation plan for the user to approve: the files to change, what changes in each, and how the result will be verified. Do not implement the plan; the user will approve it first.
+</plan_mode>`;
+/** What the plugin sends once the user approves a plan. */
+const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
 
 /**
  * A transient Antigravity outage. Captured verbatim from a real one as
@@ -78,8 +100,8 @@ const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
  * queued into a following turn rather than applied to the running one, so Paseo replaces the
- * active turn instead. `permission` is absent because agy resolves approvals internally and
- * cannot surface them over this protocol.
+ * active turn instead. agy resolves tool approvals internally and cannot surface them over this
+ * protocol, so the only permission this provider ever requests is the plugin's own plan approval.
  *
  * `prompt.command` is supported by relaunching: a command turn runs on a CLI launched without
  * `--disable-slash-commands`, and the next plain turn relaunches with it again (see the launch
@@ -107,6 +129,8 @@ const CAPABILITIES = [
   // A subagent run is followed through the transcript agy writes for its own conversation, and is
   // published as a child session under the invoke_subagent row that spawned it.
   "session.subsession",
+  // A plan-mode turn ends with a plan the user approves or dismisses (`offerPlan`).
+  "permission",
   "permission.tool_policy",
 ] as const;
 
@@ -211,6 +235,17 @@ interface Session {
   agyError: AgyErrorReport | null;
   interrupting: boolean;
   closing: boolean;
+  /**
+   * A CLI whose last turn was settled from the conversation transcript while its stream was still
+   * held behind a background task (see `backfill.ts`). It is kept alive — the task it holds is
+   * often a dev server the answer just told the user about — but it can never take another turn:
+   * a line written to it would queue behind that task. The next prompt or close disposes it.
+   */
+  detached: AgyProcess | null;
+  /** The plan a plan-mode turn ended with, while the user has not approved or dismissed it. */
+  pendingPlan: { id: string; text: string } | null;
+  /** Whether the host negotiated `permission`, without which a plan cannot be offered. */
+  readonly planApproval: boolean;
 }
 
 /**
@@ -253,6 +288,20 @@ interface PendingTurn {
    * context had reached, as opposed to the result's total across every step of the turn.
    */
   contextInputTokens?: number;
+  /** Highest step index the stream has delivered for this turn. */
+  lastStreamStep: number;
+  /**
+   * Steps published from the conversation transcript while the stream was held, with the JSON
+   * last published for each. The stream no longer owns these steps: when it catches up, its copy
+   * of them is dropped rather than published a second time.
+   */
+  readonly backfilled: Map<number, string>;
+  backfill: TranscriptPoller | null;
+  backfillTimer: NodeJS.Timeout | null;
+  /** The exact text written to agy, so a turn queued behind a detached CLI can be sent again. */
+  outgoing: string;
+  /** Sent in plan mode, so its answer is offered as a plan to implement. */
+  plan: boolean;
 }
 
 /** The fields of a tool row, kept so a call left open can be republished with a terminal status. */
@@ -387,7 +436,10 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
       for (const session of state.sessions.values()) {
         session.closing = true;
         if (session.process) running.push(session.process);
+        if (session.detached) running.push(session.detached);
         session.process = null;
+        session.detached = null;
+        for (const turn of session.pendingTurns) stopBackfill(turn);
         if (session.transcript) flushing.push(session.transcript.flush());
         // A child is followed by a watcher and a timer of its own, and its rows live in a store of
         // its own: both end with the connection that started them.
@@ -447,6 +499,9 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
       return;
     case "session.interrupt":
       await interruptSession(input, state, emit);
+      return;
+    case "session.permission":
+      await respondToPermission(input, state, emit);
       return;
     case "session.configure":
       await configureSession(input, state, emit);
@@ -519,6 +574,9 @@ async function openSession(
     agyError: null,
     interrupting: false,
     closing: false,
+    detached: null,
+    pendingPlan: null,
+    planApproval: state.capabilities.includes("permission"),
   };
   state.sessions.set(input.sessionId, session);
 
@@ -919,10 +977,14 @@ async function promptSession(
     session.launchActive.commands === profile.commands &&
     session.launchActive.skillDir === profile.skillDir;
   if (session.process?.running && (!sameLaunch || profile.schema)) session.needsRestart = true;
+  await releaseDetached(session);
   await applyPendingRestart(session);
   // The CLI reads the workspace MCP config at startup and only this path spawns one, so a toggle
   // change lands here; a turn queued behind a running one waits for its own relaunch instead.
   if (session.pendingTurns.length === 0) await syncSessionMcp(session, emit);
+  // Typing a new message instead of answering the plan prompt is the user choosing to keep
+  // planning, so the prompt is withdrawn rather than left to answer a plan that moved on.
+  resolvePendingPlan(session, emit);
 
   // What the timeline shows the user typed, and what the CLI is actually sent. A native command
   // is expanded by the CLI, so both are the same `/<name> <arguments>`; a plugin-expanded skill is
@@ -953,7 +1015,30 @@ async function promptSession(
     return;
   }
 
+  await startTurn(session, emit, {
+    shown: typed.length > 0 ? typed : text,
+    text,
+    clientMessageId: prompt.clientMessageId,
+    // The CLI expands `/name` only as the first token of a turn, so nothing may be put before a
+    // command the CLI expands itself.
+    verbatim: command !== null && expanded === null,
+  });
+}
+
+interface TurnRequest {
+  /** What the timeline shows the user sent. */
+  shown: string;
+  /** What the CLI is sent, before the system prompt and plan-mode preambles. */
+  text: string;
+  /** Absent for a turn the plugin starts itself, such as implementing an approved plan. */
+  clientMessageId?: string;
+  /** Written exactly as given: no system prompt and no plan-mode preamble in front of it. */
+  verbatim: boolean;
+}
+
+async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
   session.turnCounter += 1;
+  const plan = session.selection.mode === PLAN_MODE_ID && !request.verbatim;
   const turn: PendingTurn = {
     turnId: `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`,
     assistant: new Map(),
@@ -963,36 +1048,49 @@ async function promptSession(
     // Replaced below with the launch profile of the process that actually serves the turn: a turn
     // queued behind another is answered by that process, not by the one its own prompt implies.
     schema: false,
+    lastStreamStep: -1,
+    backfilled: new Map(),
+    backfill: null,
+    backfillTimer: null,
+    outgoing: "",
+    plan,
   };
 
   publish(session, emit, {
     type: "user_message",
     id: `user:${turn.turnId}`,
-    text: typed.length > 0 ? typed : text,
-    clientMessageId: prompt.clientMessageId,
+    text: request.shown,
+    ...(request.clientMessageId !== undefined ? { clientMessageId: request.clientMessageId } : {}),
   });
-  emit({
-    type: "session.prompt_result",
-    sessionId: session.sessionId,
-    clientMessageId: prompt.clientMessageId,
-    result: { type: "turn", turnId: turn.turnId },
-  });
+  if (request.clientMessageId !== undefined) {
+    emit({
+      type: "session.prompt_result",
+      sessionId: session.sessionId,
+      clientMessageId: request.clientMessageId,
+      result: { type: "turn", turnId: turn.turnId },
+    });
+  }
   emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
 
+  if (request.verbatim) {
+    // The system prompt's preamble waits for the first plain message.
+    turn.outgoing = request.text;
+  } else {
+    turn.outgoing = buildOutgoingText(session, plan ? `${PLAN_MODE_PREAMBLE}\n\n${request.text}` : request.text);
+    session.systemPromptSent = true;
+  }
+  await writePendingTurn(session, emit, turn);
+}
+
+/** Hands a turn to the CLI, or fails it when no CLI can take it. */
+async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn): Promise<void> {
   try {
     // Picking the process first: replacing a CLI whose stdin died settles the turns that CLI still
     // owed, and this turn must not be counted among them.
     const process = ensureProcess(session, emit);
     turn.schema = session.launchActive.schema;
     session.pendingTurns.push(turn);
-    if (command !== null && expanded === null) {
-      // The CLI expands `/name` only as the first token of a turn, so the system prompt's preamble
-      // waits for the first plain message rather than pushing the command out of that position.
-      await process.writeTurn(text);
-    } else {
-      await process.writeTurn(buildOutgoingText(session, text));
-      session.systemPromptSent = true;
-    }
+    await process.writeTurn(turn.outgoing);
   } catch (error) {
     session.pendingTurns = session.pendingTurns.filter((pending) => pending !== turn);
     emit({
@@ -1100,6 +1198,209 @@ async function applyPendingRestart(session: Session): Promise<void> {
   await process.dispose();
 }
 
+/** Disposes the CLI left holding a background task, so a fresh one serves the next turn. */
+async function releaseDetached(session: Session): Promise<void> {
+  const detached = session.detached;
+  if (!detached) return;
+  session.detached = null;
+  console.log("[antigravity] stopping the CLI that was still holding a background task");
+  await detached.dispose();
+}
+
+/**
+ * Starts reading the conversation transcript once a tool has been ACTIVE for a while, because a
+ * command agy moved to the background holds the rest of the stream back (see `backfill.ts`).
+ */
+function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit): void {
+  if (turn.backfill || turn.backfillTimer) return;
+  // The tests shorten the wait; nothing else sets this.
+  const delay = Number(process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS) || BACKFILL_DELAY_MS;
+  turn.backfillTimer = setTimeout(() => {
+    turn.backfillTimer = null;
+    const conversationId = session.conversationId;
+    // The tool reported back in time, or the turn is already over: nothing is held.
+    if (session.closing || session.pendingTurns[0] !== turn || turn.tools.size === 0) return;
+    if (conversationId === null) return;
+    console.log(
+      `[antigravity] a tool has been running for ${delay / 1000}s; following the conversation transcript`,
+    );
+    turn.backfill = new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
+      applyBackfill(session, turn, entries, emit),
+    );
+    turn.backfill.start();
+  }, delay);
+  turn.backfillTimer.unref();
+}
+
+function stopBackfill(turn: PendingTurn): void {
+  if (turn.backfillTimer) clearTimeout(turn.backfillTimer);
+  turn.backfillTimer = null;
+  turn.backfill?.stop();
+  turn.backfill = null;
+}
+
+/**
+ * Publishes the steps the transcript holds and the stream has not delivered, and settles the turn
+ * once the transcript shows its final answer. A step the stream already delivered stays the
+ * stream's; a step published here stays this function's, whatever the stream sends later.
+ */
+function applyBackfill(
+  session: Session,
+  turn: PendingTurn,
+  entries: Parameters<typeof renderBackfill>[0],
+  emit: Emit,
+): void {
+  if (session.closing || session.pendingTurns[0] !== turn) {
+    stopBackfill(turn);
+    return;
+  }
+  const render = renderBackfill(
+    entries,
+    {
+      message: (stepIndex) => itemId(turn, stepIndex, "msg"),
+      tool: (stepIndex) => itemId(turn, stepIndex, "tool"),
+    },
+    session.config.cwd,
+  );
+  for (const { stepIndex, item } of render.rows) {
+    if (stepIndex <= turn.lastStreamStep && !turn.backfilled.has(stepIndex)) continue;
+    const json = JSON.stringify(item);
+    if (turn.backfilled.get(stepIndex) === json) continue;
+    turn.backfilled.set(stepIndex, json);
+    if (item.type === "tool_call") {
+      if (item.status === "running") {
+        turn.tools.set(item.callId, {
+          id: item.id,
+          callId: item.callId,
+          name: item.name,
+          detail: item.detail,
+          metadata: { ...item.metadata },
+        });
+      } else {
+        turn.tools.delete(item.callId);
+      }
+    } else if (item.type === "assistant_message") {
+      turn.assistant.set(stepIndex, item.text);
+      turn.hadAssistantText = true;
+    }
+    publish(session, emit, item);
+  }
+  if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
+    settleFromTranscript(session, turn, emit);
+  }
+}
+
+/**
+ * Completes a turn whose answer only the transcript has. The CLI serving it still owes that turn's
+ * `result`, and will not read another line until its background task ends, so it is detached:
+ * nothing it prints is used any more, and a fresh CLI resumes the conversation for the next turn.
+ */
+function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): void {
+  stopBackfill(turn);
+  const queued = session.pendingTurns.filter((pending) => pending !== turn);
+  session.pendingTurns = [];
+  console.log(
+    `[antigravity] settled ${turn.turnId} from the conversation transcript; the CLI is still held by a background task`,
+  );
+  finalizeToolCalls(session, emit, turn, { status: "completed" });
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+  offerPlan(session, emit, turn, lastAssistantText(turn));
+
+  const stuck = session.process;
+  session.process = null;
+  if (stuck) {
+    if (session.detached) void session.detached.dispose();
+    session.detached = stuck;
+  }
+  emitNotice(
+    session,
+    emit,
+    "agy-background-task",
+    "info",
+    "A background command is still running",
+    "Antigravity left a command running in the background (for example a dev server) after its answer. It keeps running until your next message, which resumes this conversation in a fresh Antigravity CLI and stops it.",
+  );
+  // Turns written behind the settled one were queued inside the detached CLI and would never run
+  // there, so they go to the fresh one instead. Their `started` was already announced.
+  if (queued.length > 0) void resendQueued(session, emit, queued);
+}
+
+async function resendQueued(session: Session, emit: Emit, queued: readonly PendingTurn[]): Promise<void> {
+  await releaseDetached(session);
+  for (const turn of queued) await writePendingTurn(session, emit, turn);
+}
+
+/** The turn's last assistant text: what a plan-mode turn offers as its plan. */
+function lastAssistantText(turn: PendingTurn): string {
+  let last = -1;
+  for (const stepIndex of turn.assistant.keys()) last = Math.max(last, stepIndex);
+  return last === -1 ? "" : (turn.assistant.get(last) ?? "");
+}
+
+/** Asks the user to implement the plan a plan-mode turn ended with. */
+function offerPlan(session: Session, emit: Emit, turn: PendingTurn, text: string): void {
+  if (!session.planApproval || !turn.plan || text.trim().length === 0) return;
+  resolvePendingPlan(session, emit);
+  const id = `plan:${turn.turnId}`;
+  session.pendingPlan = { id, text };
+  emit({
+    type: "session.permission",
+    sessionId: session.sessionId,
+    request: {
+      id,
+      name: "plan",
+      kind: "plan",
+      title: "Implement this plan?",
+      detail: { type: "plan", text },
+      actions: [
+        { id: "implement", label: "Implement", behavior: "allow", variant: "primary", intent: "implement" },
+        { id: "dismiss", label: "Keep planning", behavior: "deny", variant: "secondary", intent: "dismiss" },
+      ],
+    },
+  });
+}
+
+/** Withdraws the plan prompt, if one is open. */
+function resolvePendingPlan(session: Session, emit: Emit): void {
+  const plan = session.pendingPlan;
+  if (!plan) return;
+  session.pendingPlan = null;
+  emit({ type: "session.permission_resolved", sessionId: session.sessionId, permissionId: plan.id });
+}
+
+/**
+ * The user's answer to a plan prompt. Approving leaves plan mode for `accept-edits` — plan mode
+ * would only have the model plan again — and sends the turn that implements the plan.
+ */
+async function respondToPermission(
+  input: Extract<ProviderInput, { type: "session.permission" }>,
+  state: ConnectionState,
+  emit: Emit,
+): Promise<void> {
+  const session = requireSession(state, input.sessionId);
+  const plan = session.pendingPlan;
+  if (!plan || plan.id !== input.permissionId) {
+    console.error(`[antigravity] ignoring an answer to unknown permission ${input.permissionId}`);
+    emit({ type: "session.permission_resolved", sessionId: session.sessionId, permissionId: input.permissionId });
+    return;
+  }
+  resolvePendingPlan(session, emit);
+  if (input.response.behavior !== "allow") return;
+
+  session.selection.mode = IMPLEMENT_MODE_ID;
+  emit({ type: "session.config", sessionId: session.sessionId, config: configState(session) });
+  // The mode is a launch flag, and the implementing turn is a plain message.
+  session.launchPending = { schema: false, commands: false, skillDir: null };
+  if (session.process?.running) session.needsRestart = true;
+  await releaseDetached(session);
+  await applyPendingRestart(session);
+  await startTurn(session, emit, {
+    shown: IMPLEMENT_PLAN_TEXT,
+    text: IMPLEMENT_PLAN_TEXT,
+    verbatim: false,
+  });
+}
+
 async function closeSession(
   input: Extract<ProviderInput, { type: "session.close" }>,
   state: ConnectionState,
@@ -1109,6 +1410,9 @@ async function closeSession(
   session.closing = true;
   const process = session.process;
   session.process = null;
+  const detached = session.detached;
+  session.detached = null;
+  for (const turn of session.pendingTurns) stopBackfill(turn);
   state.sessions.delete(input.sessionId);
 
   // Children first — those being followed and those a replay re-opened with no tailer behind them
@@ -1125,6 +1429,7 @@ async function closeSession(
   await clearAttachments(session.sessionId);
   await releaseMcpServers(session.sessionId);
   if (process) await process.dispose();
+  if (detached) await detached.dispose();
 
   // Every child that settled already closed its own session and left this set, so what is left is
   // a child that was still running: closing it silently would tell the host it completed.
@@ -1241,6 +1546,12 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
   );
 
   const turn = session.pendingTurns[0];
+  if (turn) {
+    // The transcript already supplied this step while the stream was held; publishing the
+    // stream's own copy now would only repeat it, and an assistant row would repeat its text.
+    if (turn.backfilled.has(step.step_index)) return;
+    if (step.step_index > turn.lastStreamStep) turn.lastStreamStep = step.step_index;
+  }
 
   if (step.step_type === STEP_AGENT_RESPONSE) {
     if (!turn) {
@@ -1348,6 +1659,7 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
       return;
     }
     turn.tools.set(callId, tool);
+    if (!turn.schema) scheduleBackfill(session, turn, emit);
     if (target) turn.snapshots.set(callId, readSnapshot(target));
     publish(session, emit, { type: "tool_call", ...tool, status: "running", error: null });
     return;
@@ -1770,6 +2082,7 @@ async function settleChildFollows(
 
 function handleResult(session: Session, result: AgyResult, emit: Emit): void {
   const turn = session.pendingTurns.shift() ?? null;
+  if (turn) stopBackfill(turn);
   console.log(
     `[antigravity] result status=${result.status} turns=${result.num_turns ?? "-"} text=${
       (result.response ?? "").length
@@ -1827,6 +2140,7 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     // as this turn is concerned, and a child still followed keeps following until it finishes.
     finalizeToolCalls(session, emit, turn, { status: "completed" });
     emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+    if (!turn.schema) offerPlan(session, emit, turn, lastAssistantText(turn) || response);
     return;
   }
 
@@ -1890,6 +2204,7 @@ function handleAgyExit(
     : turnFailure(session, { message: detail, code: "agy_exit" });
 
   for (const turn of pending) {
+    stopBackfill(turn);
     publishBufferedAnswer(session, emit, turn);
     const canceled = session.interrupting;
     finalizeToolCalls(
