@@ -94,15 +94,24 @@ ignores the instruction can still write files.
 
 ### Background commands
 
-When the model starts a long-running command in the background (a dev server, a watcher), agy
+When the model starts a long-running command in the background (tests, a build, a dev server), agy
 keeps that tool `ACTIVE` on the stream until the command exits and holds back every later step and
-the turn's `result` behind it — the conversation itself carries on and finishes (CLI 1.2.10). A
-tool still running after 5 s therefore makes the plugin read the conversation's own transcript
-(`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl`), publish
-the steps the stream is holding, and complete the turn as soon as the transcript shows the final
-answer. The CLI holding the command is left running, so the server stays up; a notice says so.
-It cannot take another turn (a line written to it would queue behind the command), so your next
-message stops it — and the command with it — and resumes the conversation in a fresh CLI.
+the turn's `result` behind it — the conversation itself carries on in its own transcript (CLI
+1.2.10). A tool still running after 5 s therefore makes the plugin read the conversation's own
+transcript (`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl`)
+and publish the steps the stream is holding.
+
+An answer like "the checks are running, I'll wait" is not the end of the turn: while a background
+command the turn started has not ended, the turn stays running. When the command ends, agy wakes the
+model, and what it does then is published into the same turn, which completes at the model's final
+answer once no command it started is still running and no subagent is either. A message you send
+meanwhile waits for that, as it would behind any running turn; stopping the agent cancels the turn.
+
+A command that is still running after 15 minutes — a dev server never ends — completes the turn
+anyway, and a notice says the command is still running. The CLI holding it is left running, so the
+server stays up; if the command ends later and the model carries on, that is shown as a turn of its
+own. The CLI cannot take another turn (a line written to it would queue behind the command), so
+your next message stops it — and the command with it — and resumes the conversation in a fresh CLI.
 
 ## Subagents
 

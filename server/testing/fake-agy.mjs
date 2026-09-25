@@ -7,6 +7,7 @@
  *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
+ *                        | background
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all), or
@@ -29,6 +30,10 @@
  *   FAKE_RESULT_ERROR    text of the failed result in the `error` scenario and in `tool-hang`
  *                        with FAKE_TOOL_END=error
  *   FAKE_TOOL_END        how `tool-hang` ends the turn: interrupt (default) | error | die
+ *   FAKE_BACKGROUND_GATE file the `background` scenario waits for: the moment its task ends
+ *   FAKE_BACKGROUND_END  what the `background` transcript says of its task: never (default) |
+ *                        finish (ends at the gate, and the model carries on) | unmarked
+ *   FAKE_BACKGROUND_FINAL_GATE  file `finish` waits for before the model's new final answer
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
@@ -543,17 +548,25 @@ readline.createInterface({ input }).on("line", async (line) => {
     // server): the stream stops at that tool's ACTIVE line while the conversation carries on and
     // finishes in its own transcript. Everything after it — and the result — is held until the
     // task ends, which here is when the test writes FAKE_BACKGROUND_GATE.
+    //
+    // FAKE_BACKGROUND_END decides what the transcript says about the task: `never` (default) is a
+    // dev server that never reports an end; `finish` is a test run whose end agy announces once the
+    // gate opens, after which the model carries on — one tool call, then FAKE_BACKGROUND_FINAL_GATE,
+    // then a new final answer; `unmarked` starts the task under wording the plugin does not know.
+    const ending = process.env.FAKE_BACKGROUND_END ?? "never";
     const first = step;
-    step += 5;
+    step += ending === "finish" ? 9 : 5;
     const command = { CommandLine: "npm start" };
     send(stepEvent(first, "DONE", "agent_response", { text_delta: "Starting the server." }));
     send(stepEvent(first + 1, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command } }));
 
     const encode = (value) => JSON.stringify(value);
+    const started =
+      ending === "unmarked" ? "Tool is still running." : "Tool is running as a background task with task id: task-1";
     const transcript = [
       { step_index: first - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` },
       { step_index: first, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] },
-      { step_index: first + 1, source: "MODEL", type: "GENERIC", status: "DONE", content: "Tool is running as a background task with task id: task-1" },
+      { step_index: first + 1, source: "MODEL", type: "GENERIC", status: "DONE", content: started },
       { step_index: first + 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command", args: { CommandLine: encode("curl -s localhost:4719/health") } }] },
       { step_index: first + 3, source: "MODEL", type: "GENERIC", status: "DONE", content: "The command exited with code 0.\nOutput:\nok" },
       { step_index: first + 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `The server is running (${text}).` },
@@ -562,6 +575,19 @@ readline.createInterface({ input }).on("line", async (line) => {
     await writeChildLines(path, transcript.map((line) => JSON.stringify(line)));
 
     await waitForGate("FAKE_BACKGROUND_GATE");
+    if (ending === "finish") {
+      // agy wakes the model with a SYSTEM_MESSAGE when the task ends, and the model carries on in
+      // this same process; the steps land in the transcript long before the stream catches up.
+      await writeChildLines(path, [
+        { step_index: first + 5, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: 'Task id "task-1" finished with result:\nOutput: ok' },
+        { step_index: first + 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command", args: { CommandLine: encode("git push") } }] },
+        { step_index: first + 7, source: "MODEL", type: "GENERIC", status: "DONE", content: "The command exited with code 0.\nOutput:\npushed" },
+      ].map((line) => JSON.stringify(line)));
+      await waitForGate("FAKE_BACKGROUND_FINAL_GATE");
+      await writeChildLines(path, [
+        JSON.stringify({ step_index: first + 8, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `The checks passed and the branch is pushed (${text}).` }),
+      ]);
+    }
     send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "started" } }));
     send(stepEvent(first + 2, "DONE", "agent_response", {}));
     send(stepEvent(first + 3, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "curl -s localhost:4719/health" } } }));

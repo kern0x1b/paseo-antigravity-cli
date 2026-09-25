@@ -142,7 +142,11 @@ afterEach(async () => {
     "FAKE_EDIT_GATE",
     "FAKE_EDIT_SKIP_WRITE",
     "FAKE_BACKGROUND_GATE",
+    "FAKE_BACKGROUND_END",
+    "FAKE_BACKGROUND_FINAL_GATE",
     "PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS",
+    "PASEO_ANTIGRAVITY_POLL_MS",
+    "PASEO_ANTIGRAVITY_TASK_HOLD_MS",
   ]) {
     delete process.env[key];
   }
@@ -3002,20 +3006,43 @@ describe("subagents", () => {
 
 
 describe("background commands", () => {
-  function heldTurn(): void {
+  /**
+   * A turn whose stream a background task holds. `holdMs` is how long a turn with a task still open
+   * is kept running; the dev server of the default scenario never ends, so it is what settles it.
+   */
+  function heldTurn(options: { ending?: "never" | "finish" | "unmarked"; holdMs?: number } = {}): void {
     process.env.FAKE_SCENARIO = "background";
+    process.env.FAKE_BACKGROUND_END = options.ending ?? "never";
     process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
+    process.env.PASEO_ANTIGRAVITY_POLL_MS = "20";
+    if (options.holdMs !== undefined) process.env.PASEO_ANTIGRAVITY_TASK_HOLD_MS = String(options.holdMs);
     process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
+    process.env.FAKE_BACKGROUND_FINAL_GATE = join(tempDir, "background-final-gate");
     const home = join(tempDir, "home");
     mkdirSync(home, { recursive: true });
     process.env.HOME = home;
   }
 
-  it("completes a turn from the transcript while a background command holds the stream", async () => {
-    heldTurn();
+  function backgroundNotices(events: ProviderEvent[]) {
+    return events.filter((event) => event.type === "session.notice" && event.notice.id === "agy-background-task");
+  }
+
+  /** The held turn's first answer is on screen: the transcript was read and the turn is being held. */
+  async function waitForFirstAnswer(events: ProviderEvent[], text = "start it"): Promise<void> {
+    await waitFor(
+      () => [...paseoView(events).messages.values()].find((message) => message === `The server is running (${text}).`),
+      "the held turn's first answer",
+    );
+  }
+
+  it("completes a turn from the transcript once a task still open outlasts the hold", async () => {
+    heldTurn({ holdMs: 300 });
     const { connection, events } = await connect();
     await openSession(connection);
     await prompt(connection, "start it");
+    await waitForFirstAnswer(events);
+    // The dev server never reports an end, so the turn is running until the hold runs out.
+    expect(turns(events, "completed")).toEqual([]);
     await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
 
     expect([...paseoView(events).messages.values()]).toEqual([
@@ -3028,9 +3055,7 @@ describe("background commands", () => {
       ["npm start", "completed"],
       ["curl -s localhost:4719/health", "completed"],
     ]);
-    expect(
-      events.filter((event) => event.type === "session.notice" && event.notice.id === "agy-background-task"),
-    ).toHaveLength(1);
+    expect(backgroundNotices(events)).toHaveLength(1);
 
     // The task ends and the held CLI prints everything it owed: none of it may be shown twice.
     const settled = paseoView(events).messages;
@@ -3044,7 +3069,7 @@ describe("background commands", () => {
   });
 
   it("resumes the conversation in a fresh CLI for the next prompt", async () => {
-    heldTurn();
+    heldTurn({ holdMs: 200 });
     const { connection, events } = await connect();
     await openSession(connection);
     await prompt(connection, "start it");
@@ -3058,6 +3083,92 @@ describe("background commands", () => {
     const launches = readArgvLog();
     expect(launches).toHaveLength(2);
     expect(launches[1]).toContain("--conversation");
+  });
+
+  it("keeps one turn running while its task runs and completes it at the answer the model carries on to", async () => {
+    heldTurn({ ending: "finish" });
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "check it");
+    await waitForFirstAnswer(events, "check it");
+    expect(turns(events, "completed")).toEqual([]);
+
+    // The task ends and the model carries on: its steps belong to the same turn, still running.
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    await waitFor(
+      () =>
+        timelineItems(events).find(
+          (item) => item.type === "tool_call" && item.detail.type === "shell" && item.detail.command === "git push",
+        ),
+      "the step the model carried on with",
+    );
+    expect(turns(events, "completed")).toEqual([]);
+    expect(turns(events, "started")).toHaveLength(1);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    const [started] = turnIds(events, "started");
+    expect(turnIds(events, "started")).toEqual([started]);
+    expect(turnIds(events, "completed")).toEqual([started]);
+    expect([...paseoView(events).messages.values()]).toEqual([
+      "Starting the server.",
+      "The server is running (check it).",
+      "The checks passed and the branch is pushed (check it).",
+    ]);
+    const push = timelineItems(events).filter(
+      (item) => item.type === "tool_call" && item.detail.type === "shell" && item.detail.command === "git push",
+    );
+    expect(push.at(-1)).toMatchObject({ status: "completed" });
+    // Nothing is left running, so nothing needs explaining.
+    expect(backgroundNotices(events)).toEqual([]);
+  });
+
+  it("cancels a held turn when it is interrupted", async () => {
+    heldTurn({ ending: "finish" });
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "check it");
+    await waitForFirstAnswer(events, "check it");
+
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
+    await waitFor(() => turns(events, "canceled")[0], "the held turn to be canceled");
+    expect(turns(events, "completed")).toEqual([]);
+    expect(turnIds(events, "canceled")).toEqual(turnIds(events, "started"));
+  });
+
+  it("runs a prompt sent while a turn is held once that turn completes", async () => {
+    heldTurn({ ending: "finish" });
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "check it");
+    await waitForFirstAnswer(events, "check it");
+
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "next", "m2");
+    expect(turns(events, "started")).toHaveLength(2);
+    expect(turns(events, "completed")).toEqual([]);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[1], "the queued turn to complete");
+
+    expect(turnIds(events, "completed")).toEqual(turnIds(events, "started"));
+    expect(paseoView(events).finalText).toBe("echo:next\n");
+    // Written to a fresh CLI that resumes the conversation, never to the one the task held.
+    const launches = readArgvLog();
+    expect(launches).toHaveLength(2);
+    expect(launches[1]).toContain("--conversation");
+  });
+
+  it("completes at once when the transcript shows no task it could wait for", async () => {
+    // No hold limit is shortened: holding this turn would time the test out.
+    heldTurn({ ending: "unmarked" });
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    expect(backgroundNotices(events)).toHaveLength(1);
   });
 });
 
