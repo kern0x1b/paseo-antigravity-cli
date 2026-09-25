@@ -3,10 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { pluginDataDir } from "./plugindata";
 import { listConversations } from "./sessions";
 import { writeConversationDb, type ConversationFixture } from "./testing/conversation-db";
 
 const originalHome = process.env.HOME;
+const originalPaseoHome = process.env.PASEO_HOME;
 
 let home: string;
 let cwd: string;
@@ -17,11 +19,14 @@ beforeEach(() => {
   mkdirSync(cwd, { recursive: true });
   // The CLI's index lives under the home directory, which is how a test repoints it.
   process.env.HOME = home;
+  process.env.PASEO_HOME = join(home, ".paseo");
 });
 
 afterEach(() => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalPaseoHome === undefined) delete process.env.PASEO_HOME;
+  else process.env.PASEO_HOME = originalPaseoHome;
   rmSync(home, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -87,6 +92,18 @@ describe("listConversations", () => {
       { conversationId: "elsewhere" },
       { conversationId: "orphan" },
     ]);
+  });
+
+  it("takes the workspace, not the plugin's own attachments folder that agy lists before it", () => {
+    const attachments = pluginDataDir("attachments", "session-1");
+    mkdirSync(attachments, { recursive: true });
+    writeConversationDb(home, [conversation({ conversationId: "here", workspacePaths: [attachments, cwd] })]);
+
+    expect(listConversations({}).map((session) => session.cwd)).toEqual([cwd]);
+    expect(listConversations({ cwd }).map((session) => session.persistence.data)).toEqual([
+      { conversationId: "here" },
+    ]);
+    expect(listConversations({ cwd: attachments })).toEqual([]);
   });
 
   it("filters by a case-insensitive substring of the title or the preview", () => {

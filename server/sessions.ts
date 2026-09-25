@@ -1,8 +1,9 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import type { ProviderSessionSummary } from "@getpaseo/plugin/server/provider";
+import { pluginDataDir } from "./plugindata";
 
 const DEFAULT_LIMIT = 50;
 
@@ -104,7 +105,9 @@ function toRow(value: Record<string, unknown>): ConversationRow {
 
 /**
  * `workspace_uris` holds a JSON array of `file://` URIs, and is empty for a conversation with no
- * workspace. A malformed value is treated the same as an empty one.
+ * workspace. A malformed value is treated the same as an empty one. agy records every `--add-dir`
+ * the plugin passed, sorted, so the plugin's own folders (attachments, skills) can come before the
+ * workspace; they are never the conversation's workspace and are skipped.
  */
 function firstWorkspacePath(workspaceUris: string): string | null {
   if (workspaceUris.trim().length === 0) return null;
@@ -114,12 +117,21 @@ function firstWorkspacePath(workspaceUris: string): string | null {
   } catch {
     return null;
   }
-  if (!Array.isArray(decoded) || typeof decoded[0] !== "string") return null;
-  try {
-    return fileURLToPath(decoded[0]);
-  } catch {
-    return null;
+  if (!Array.isArray(decoded)) return null;
+  const own = stripTrailingSlash(pluginDataDir());
+  for (const uri of decoded) {
+    if (typeof uri !== "string") continue;
+    let path: string;
+    try {
+      path = fileURLToPath(uri);
+    } catch {
+      continue;
+    }
+    const bare = stripTrailingSlash(path);
+    if (bare === own || bare.startsWith(`${own}${sep}`)) continue;
+    return path;
   }
+  return null;
 }
 
 /** Antigravity stores `2026-09-23 13:31:32.28859+00:00`; Paseo expects an ISO timestamp. */
