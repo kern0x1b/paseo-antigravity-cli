@@ -107,7 +107,7 @@ model, and what it does then is published into the same turn, which completes at
 answer once no command it started is still running and no subagent is either. A message you send
 meanwhile waits for that, as it would behind any running turn; stopping the agent cancels the turn.
 
-A command that is still running after 15 minutes — a dev server never ends — completes the turn
+A command that is still running after 30 minutes — a dev server never ends — completes the turn
 anyway, and a notice says the command is still running. The CLI holding it is left running, so the
 server stays up; if the command ends later and the model carries on, that is shown as a turn of its
 own. The CLI cannot take another turn (a line written to it would queue behind the command), so

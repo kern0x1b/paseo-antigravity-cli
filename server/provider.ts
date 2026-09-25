@@ -89,7 +89,7 @@ const BACKFILL_DELAY_MS = 5_000;
  * ended. Tests and builds end, and the model carries on in the same turn when they do; a dev server
  * never does, and a turn held for it would never finish, so past this it is settled anyway.
  */
-const TASK_HOLD_MS = 15 * 60_000;
+const TASK_HOLD_MS = 30 * 60_000;
 
 const PLAN_MODE_ID = "plan";
 /** The mode an approved plan is implemented in. */
