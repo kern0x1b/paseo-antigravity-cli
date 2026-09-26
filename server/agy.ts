@@ -22,6 +22,12 @@ export interface AgyLaunchConfig {
    * skill's instructions refer to. Set for that one turn's launch, like the schema file.
    */
   skillDir?: string;
+  /**
+   * The session's private folder holding `.agents/mcp_config.json`, when Paseo's MCP servers are
+   * shared. agy loads a directory's own MCP servers from the directories it was given, so this is
+   * how one process — and no other — is handed credentials.
+   */
+  mcpDir?: string;
   /** Extra directories the user allowed, each its own --add-dir. */
   addDirs?: readonly string[];
   /** Passes --sandbox, which restricts what terminal commands may reach. */
@@ -83,6 +89,7 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
     // directories are validated before they reach here.
     ...(config.attachmentDir ? ["--add-dir", config.attachmentDir] : []),
     ...(config.skillDir ? ["--add-dir", config.skillDir] : []),
+    ...(config.mcpDir ? ["--add-dir", config.mcpDir] : []),
     ...(config.addDirs ?? []).flatMap((dir) => ["--add-dir", dir]),
     // A command turn needs expansion; every other turn must keep plain text from starting with
     // `/` out of the CLI's slash parser (` /skills` and `/tasks` kill a print-mode turn outright).

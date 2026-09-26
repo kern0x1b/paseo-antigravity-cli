@@ -21,6 +21,12 @@ export interface Timing {
   terminateGraceMs: number;
   /** How long the exit of a CLI waits for its output to end, which something it started can hold open. */
   drainGraceMs: number;
+  /**
+   * How long the attachments and schema file of a session that is not open are kept after they were
+   * last touched. A session that closed because the plugin reloaded comes back, and may still point
+   * the model at an image it attached before.
+   */
+  orphanRetentionMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -29,4 +35,5 @@ export const DEFAULT_TIMING: Timing = {
   failureQuietMs: 30_000,
   terminateGraceMs: 3_000,
   drainGraceMs: 2_000,
+  orphanRetentionMs: 7 * 24 * 60 * 60 * 1000,
 };

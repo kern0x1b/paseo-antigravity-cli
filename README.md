@@ -237,30 +237,29 @@ Settings saved while these were toggles (`true`/`false`) read as *On*/*Off*.
 
 Antigravity reads MCP servers from `~/.gemini/config/mcp_config.json` and from
 `<dir>/.agents/mcp_config.json` for each directory it was given. With **Share Paseo tools with
-Antigravity** on, the plugin writes Paseo's `mcpServers` into `<cwd>/.agents/mcp_config.json` as
-`paseo-<name>` entries before the CLI starts; the model reaches them through agy's `call_mcp_tool`.
+Antigravity** on, the plugin writes Paseo's `mcpServers` as `paseo-<name>` entries into
+`plugin-data/antigravity-cli/mcp/<sessionId>/.agents/mcp_config.json` before the CLI starts, and
+gives the CLI that folder as an extra `--add-dir`; the model reaches them through agy's
+`call_mcp_tool`.
 
 - Off by default. Nothing is written until you turn it on.
-- Those entries hold whatever credentials the servers use (HTTP headers, or environment variables
-  for stdio servers). When the session's workspace is inside a git work tree the plugin adds the
-  file's path, relative to the repository root, to that repository's own `info/exclude` (the local
-  one under `.git`, which linked worktrees share). That file is never committed and is not shared
-  with anyone else, and `git add .` treats its lines exactly like `.gitignore` lines — so the
-  config, and the token in it, cannot be committed by accident. Nothing else is written there: the
-  plugin never edits `.gitignore`, and it removes its two lines again when the last Paseo session
-  in that workspace closes. A notice naming the file is shown whenever it is written.
-- Outside a git work tree, or when `git` is not installed, nothing is excluded: sharing still
-  works, but keep `.agents/mcp_config.json` out of your commits yourself (a `.git/info/exclude`
-  line in whichever repository holds the workspace, an entry in a global `core.excludesFile`, or
-  `.gitignore` if you accept committing that entry).
-- Ownership is tracked in a ledger; on the last `session.close` for that directory the plugin
-  removes only its own entries, leaves every other entry untouched, and deletes the file only if
-  the plugin created it. Entries left behind by a crash are cleaned up on the next `session.open`
-  there.
-- An existing file that is not valid JSON is never overwritten: the plugin warns and skips the
-  injection for that session.
-- `agy mcp list` lists **only** your global config, so it will not show these entries. Look at
-  `<cwd>/.agents/mcp_config.json` instead.
+- The entries hold whatever credentials the servers use (HTTP headers, or environment variables
+  for stdio servers), so they are **not written into your workspace**. Each session has a folder of
+  its own inside the plugin's data directory (mode 0700, the file 0600), and only that session's CLI
+  is given it: two sessions in one workspace never hold each other's credentials, there is nothing
+  to keep out of a commit, and no file of yours is touched. A notice names the file whenever it is
+  written.
+- The folder is deleted when the session closes or the plugin connection ends. One left behind by a
+  process that was killed is swept when the plugin next connects and whenever a session opens.
+- Earlier versions wrote the entries into `<cwd>/.agents/mcp_config.json` and added that file to the
+  repository's `info/exclude`. The first time this version connects it takes back what its ledger
+  (`mcp-ledger.json`) says was written there — its own `paseo-*` entries and exclude lines, and the
+  file or folder it created — and leaves everything else.
+- `agy mcp list` lists **only** your global config, so it will not show these entries. Look at the
+  session's file instead.
+- Because agy has no per-process MCP option, the credentials are still in a file the CLI reads; any
+  process running as you can read it. What changed is that nothing shared between sessions, or
+  inside a repository, holds them.
 
 ## Files the plugin writes
 
@@ -268,14 +267,10 @@ Under `$PASEO_HOME` (default `~/.paseo`), in `plugin-data/antigravity-cli/`:
 
 | Path | Contents |
 |---|---|
-| `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload — a subagent's child session is stored the same way, under the subagent's own conversation id. Newest snapshot per row id, capped at 500 rows, flushed on close. Not written when the session has `persist: false`. |
-| `attachments/<sessionId>/<n>.<ext>` | Images decoded from prompts. Deleted on `session.close`. |
-| `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with. Deleted on `session.close`. |
-| `mcp-ledger.json` | Which `paseo-*` entries the plugin wrote, in which workspace, for which sessions, and the `info/exclude` lines it added there. |
-
-Plus, only while sharing is on, `<cwd>/.agents/mcp_config.json` in the session's workspace — and,
-when that workspace is inside a git work tree, the two lines in that repository's local
-`info/exclude` that keep the file out of its commits.
+| `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload — a subagent's child session is stored the same way, under the subagent's own conversation id. Newest snapshot per row id, capped at 500 rows (a first line says so when older rows were dropped, and a replay tells you), flushed on close, replaced atomically and readable by you alone. A row that was still running when the plugin went away replays as canceled. Not written when the session has `persist: false`. |
+| `attachments/<sessionId>/<n>.<ext>` | Images decoded from prompts, up to 25 MiB each. Deleted on `session.close`, and swept a week after last use when the session never came back. |
+| `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with. Deleted on `session.close`, and swept like attachments. |
+| `mcp/<sessionId>/.agents/mcp_config.json` | Only while sharing is on: the session's MCP entries, with their credentials. Deleted on `session.close` and when the connection ends. |
 
 The plugin reads three things outside those directories: the `toolPermission` value in
 `~/.gemini/antigravity-cli/settings.json` (so the approval select can name it), the

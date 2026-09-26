@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
-import { pluginDataDir, unsafePathChars } from "./plugindata";
+import { pluginDataDir, safePathSegment } from "./plugindata";
 
 /**
  * Remembers the timeline rows a conversation produced so `session.open` with `history: "replay"`
@@ -10,8 +10,13 @@ import { pluginDataDir, unsafePathChars } from "./plugindata";
  *
  * Items are keyed by id because streaming updates republish the same row with more text; keeping
  * only the newest snapshot per id is what makes replay match the live view.
+ *
+ * The file holds a conversation's words, so it is readable by its owner alone, and is replaced as a
+ * whole rather than rewritten in place: a crash leaves the previous file, never half of a new one.
+ * When more than `MAX_ITEMS` rows were produced the oldest are dropped, and the file says so in a
+ * first line of its own, so a replay can tell the user that it is not the whole conversation.
  */
-const MAX_ITEMS = 500;
+export const MAX_ITEMS = 500;
 const WRITE_DEBOUNCE_MS = 250;
 
 export class TranscriptStore {
@@ -23,6 +28,8 @@ export class TranscriptStore {
   private readonly path: string;
   private writeTimer: NodeJS.Timeout | null = null;
   private writeChain: Promise<void> = Promise.resolve();
+  /** Whether rows older than the ones held were dropped, now or in an earlier run. */
+  truncated = false;
 
   constructor(conversationId: string) {
     this.path = transcriptPath(conversationId);
@@ -36,9 +43,11 @@ export class TranscriptStore {
         const trimmed = line.trim();
         if (trimmed.length === 0) continue;
         try {
-          const item = JSON.parse(trimmed) as ProviderTimelineItem;
+          const item = JSON.parse(trimmed) as ProviderTimelineItem & { truncated?: unknown };
           if (item && typeof item === "object" && typeof item.id === "string") {
             store.items.set(item.id, item);
+          } else if (item && typeof item === "object" && item.truncated === true) {
+            store.truncated = true;
           }
         } catch {
           // A torn final line is expected after a hard kill; ignore it.
@@ -58,6 +67,7 @@ export class TranscriptStore {
       const oldest = this.items.keys().next();
       if (oldest.done) break;
       this.items.delete(oldest.value);
+      this.truncated = true;
     }
 
     this.scheduleWrite();
@@ -88,20 +98,23 @@ export class TranscriptStore {
 
   private async write(): Promise<void> {
     const path = this.path;
-    const body = this.list()
-      .map((item) => JSON.stringify(item))
-      .join("\n");
+    const lines = this.list().map((item) => JSON.stringify(item));
+    if (this.truncated) lines.unshift(JSON.stringify({ truncated: true }));
+    const body = lines.join("\n");
+    const temp = `${path}.${process.pid}.tmp`;
     try {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, body.length > 0 ? `${body}\n` : "", "utf8");
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(temp, body.length > 0 ? `${body}\n` : "", { encoding: "utf8", mode: 0o600 });
+      await rename(temp, path);
     } catch (error) {
+      await rm(temp, { force: true }).catch(() => undefined);
       console.error(`[antigravity] could not persist transcript: ${describe(error)}`);
     }
   }
 }
 
 function transcriptPath(conversationId: string): string {
-  return pluginDataDir("transcripts", `${conversationId.replace(unsafePathChars, "_")}.jsonl`);
+  return pluginDataDir("transcripts", `${safePathSegment(conversationId)}.jsonl`);
 }
 
 /** Whether this plugin ever stored a timeline for the conversation. */

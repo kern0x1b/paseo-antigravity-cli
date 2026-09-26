@@ -12,3 +12,12 @@ export function pluginDataDir(...segments: readonly string[]): string {
 
 /** Session and conversation ids come from outside and are not guaranteed to be path-safe. */
 export const unsafePathChars = /[^A-Za-z0-9._-]/g;
+
+/**
+ * A single path segment made from an id that came from outside. Dots are kept, but never as `.` or
+ * `..` or a run that could climb out of the folder the segment is joined to.
+ */
+export function safePathSegment(value: string): string {
+  const segment = value.replace(unsafePathChars, "_").replace(/\.{2,}/g, "_");
+  return segment === "" || segment === "." ? "_" : segment;
+}

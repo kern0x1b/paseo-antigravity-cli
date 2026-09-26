@@ -9,6 +9,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +32,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createProvider } from "./provider";
 import type { Timing } from "./timing";
+import { MAX_ITEMS } from "./transcript";
 import { parseTranscriptLines, renderChild } from "./subagents";
 import { writeConversationDb } from "./testing/conversation-db";
 
@@ -661,7 +663,7 @@ describe("launch settings", () => {
 
     expect(setting(events, "sandbox")).toMatchObject({ type: "select", value: "on" });
     expect(setting(events, "shareMcp")).toMatchObject({ type: "select", value: "on" });
-    expect(existsSync(join(tempDir, ".agents", "mcp_config.json"))).toBe(true);
+    expect(existsSync(join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "mcp", "session-1", ".agents", "mcp_config.json"))).toBe(true);
 
     await prompt(connection, "hello");
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
@@ -768,14 +770,17 @@ describe("Paseo MCP sharing", () => {
       env: { PASEO_TOKEN: "secret" },
     },
   } satisfies ProviderSessionConfig["mcpServers"];
-  const configPath = () => join(tempDir, ".agents", "mcp_config.json");
-  const ledgerPath = () => join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "mcp-ledger.json");
-  const readConfig = () =>
-    JSON.parse(readFileSync(configPath(), "utf8")) as { mcpServers: Record<string, unknown> };
+  const mcpRoot = () => join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "mcp");
+  const sessionDir = (sessionId = "session-1") => join(mcpRoot(), sessionId);
+  const configPath = (sessionId = "session-1") => join(sessionDir(sessionId), ".agents", "mcp_config.json");
+  const readConfig = (sessionId = "session-1") =>
+    JSON.parse(readFileSync(configPath(sessionId), "utf8")) as { mcpServers: Record<string, unknown> };
   const notices = (events: ProviderEvent[], id: string) =>
     events.filter((event) => event.type === "session.notice" && event.notice.id === id);
+  const addDirs = (argv: string[]): string[] =>
+    argv.flatMap((arg, index) => (argv[index - 1] === "--add-dir" ? [arg] : []));
 
-  it("writes Paseo's servers into the workspace config before the CLI starts", async () => {
+  it("writes Paseo's servers into a folder of the session's own before the CLI starts", async () => {
     const { connection, events } = await connect();
     await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } });
 
@@ -790,11 +795,14 @@ describe("Paseo MCP sharing", () => {
       },
     });
     expect(statSync(configPath()).mode & 0o777).toBe(0o600);
+    expect(statSync(sessionDir()).mode & 0o777).toBe(0o700);
+    // Nothing is written into the user's workspace.
+    expect(existsSync(join(tempDir, ".agents"))).toBe(false);
 
     const notice = notices(events, "mcp-shared")[0];
     expect(notice).toMatchObject({ notice: { severity: "warning" } });
     if (notice?.type === "session.notice") {
-      // The file holds credentials and is inside the user's repository.
+      // The file holds credentials, and the notice says where without repeating them.
       expect(notice.notice.description).toContain(configPath());
       expect(notice.notice.description).not.toContain("secret");
     }
@@ -803,10 +811,11 @@ describe("Paseo MCP sharing", () => {
     await prompt(connection, "hello");
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
     expect(readArgvLog()).toHaveLength(1);
-    expect(readConfig().mcpServers).toHaveProperty("paseo-paseo");
+    // agy loads the folder because it is one of the directories it was given.
+    expect(addDirs(readArgv())).toContain(sessionDir());
   });
 
-  it("adds the entries on the next turn after the select is switched on", async () => {
+  it("adds the folder on the next turn after the select is switched on", async () => {
     const { connection, events } = await connect();
     await openSession(connection, { mcpServers: SERVERS });
     expect(existsSync(configPath())).toBe(false);
@@ -814,7 +823,7 @@ describe("Paseo MCP sharing", () => {
 
     await prompt(connection, "hello");
     await waitFor(() => turns(events, "completed")[0], "the first turn");
-    expect(readArgvLog()).toHaveLength(1);
+    expect(addDirs(readArgvLog()[0] ?? [])).not.toContain(sessionDir());
 
     await connection.send({
       type: "session.configure",
@@ -828,84 +837,113 @@ describe("Paseo MCP sharing", () => {
     await waitFor(() => turns(events, "completed")[1], "the second turn");
     // The CLI only reads the file at startup, so the toggle rides the same relaunch as a flag.
     expect(readArgvLog()).toHaveLength(2);
+    expect(addDirs(readArgvLog()[1] ?? [])).toContain(sessionDir());
     expect(readConfig().mcpServers).toHaveProperty("paseo-paseo");
     expect(notices(events, "mcp-shared")).toHaveLength(1);
   });
 
-  it("keeps two sessions in one workspace from removing each other's entries", async () => {
-    const { connection } = await connect();
+  it("removes the folder when the toggle is switched off, and stops passing it", async () => {
+    const { connection, events } = await connect();
     await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } });
-    await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } }, { sessionId: "session-2" });
-
-    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
-    expect(readConfig().mcpServers).toHaveProperty("paseo-paseo");
-
-    await connection.send({ type: "session.close", requestId: "close-2", sessionId: "session-2" });
-    // The plugin created the file, so nothing is left to keep it around.
-    expect(existsSync(configPath())).toBe(false);
+    await connection.send({
+      type: "session.configure",
+      requestId: "cfg-off",
+      sessionId: "session-1",
+      changes: { settings: { shareMcp: "off" } },
+    } as ProviderInput);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    expect(existsSync(sessionDir())).toBe(false);
+    expect(addDirs(readArgv())).not.toContain(sessionDir());
   });
 
-  it("releases the entries when the connection closes", async () => {
+  it("gives two sessions in one workspace a folder each, so neither holds the other's credentials", async () => {
+    const { connection } = await connect();
+    const serversFor = (token: string): ProviderSessionConfig["mcpServers"] => ({
+      paseo: { type: "stdio", command: "paseo-mcp", args: [], env: { PASEO_TOKEN: token } },
+    });
+    await openSession(connection, { mcpServers: serversFor("TOKEN-A"), settings: { shareMcp: true } }, { sessionId: "a" });
+    await openSession(connection, { mcpServers: serversFor("TOKEN-B"), settings: { shareMcp: true } }, { sessionId: "b" });
+
+    expect(readFileSync(configPath("a"), "utf8")).toContain("TOKEN-A");
+    expect(readFileSync(configPath("a"), "utf8")).not.toContain("TOKEN-B");
+    expect(readFileSync(configPath("b"), "utf8")).not.toContain("TOKEN-A");
+
+    // One closing takes only its own folder.
+    await connection.send({ type: "session.close", requestId: "close-a", sessionId: "a" });
+    expect(existsSync(sessionDir("a"))).toBe(false);
+    expect(existsSync(configPath("b"))).toBe(true);
+  });
+
+  it("removes the folder when the session closes and when the connection does", async () => {
     const { connection } = await connect();
     await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } });
     expect(existsSync(configPath())).toBe(true);
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    expect(existsSync(sessionDir())).toBe(false);
 
+    await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } }, { sessionId: "session-2" });
+    expect(existsSync(configPath("session-2"))).toBe(true);
     await connection.close();
-
-    expect(existsSync(configPath())).toBe(false);
+    expect(existsSync(sessionDir("session-2"))).toBe(false);
   });
 
-  it("removes the entries of a session that died without closing", async () => {
-    mkdirSync(join(tempDir, ".agents"), { recursive: true });
-    writeFileSync(
-      configPath(),
-      `${JSON.stringify(
-        {
-          mcpServers: {
-            github: { command: "gh-mcp", disabled: false },
-            "paseo-ghost": { command: "ghost", disabled: false },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-    mkdirSync(join(tempDir, "paseo-home", "plugin-data", "antigravity-cli"), { recursive: true });
-    writeFileSync(
-      ledgerPath(),
-      `${JSON.stringify(
-        { version: 1, workspaces: { [tempDir]: { created: false, entries: { "paseo-ghost": ["ghost"] } } } },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
+  it("removes the folder of a session that died without closing, when the next one opens", async () => {
+    mkdirSync(join(sessionDir("ghost"), ".agents"), { recursive: true });
+    writeFileSync(configPath("ghost"), '{"mcpServers":{"paseo-paseo":{"command":"ghost"}}}\n', "utf8");
 
     const { connection } = await connect();
     await openSession(connection);
 
-    expect(readConfig().mcpServers).toEqual({ github: { command: "gh-mcp", disabled: false } });
-    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).workspaces).toEqual({});
+    expect(existsSync(sessionDir("ghost"))).toBe(false);
   });
 
-  it("leaves an invalid workspace config alone and says so", async () => {
+  it("removes what an earlier version wrote into the workspace when the plugin connects", async () => {
     mkdirSync(join(tempDir, ".agents"), { recursive: true });
-    writeFileSync(configPath(), "{ not json", "utf8");
+    writeFileSync(
+      join(tempDir, ".agents", "mcp_config.json"),
+      `${JSON.stringify({ mcpServers: { github: { command: "gh-mcp", disabled: false }, "paseo-ghost": { command: "ghost", disabled: false } } }, null, 2)}\n`,
+      "utf8",
+    );
+    mkdirSync(join(tempDir, "paseo-home", "plugin-data", "antigravity-cli"), { recursive: true });
+    writeFileSync(
+      join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "mcp-ledger.json"),
+      JSON.stringify({ version: 1, workspaces: { [tempDir]: { created: false, entries: { "paseo-ghost": ["ghost"] } } } }),
+      "utf8",
+    );
 
+    await connect();
+
+    const left = JSON.parse(readFileSync(join(tempDir, ".agents", "mcp_config.json"), "utf8")) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(left.mcpServers).toEqual({ github: { command: "gh-mcp", disabled: false } });
+  });
+
+  it("says so, and carries on, when the folder cannot be written", async () => {
+    mkdirSync(join(tempDir, "paseo-home", "plugin-data"), { recursive: true });
+    // A file where the plugin's data directory has to go.
+    writeFileSync(join(tempDir, "paseo-home", "plugin-data", "antigravity-cli"), "");
     const { connection, events } = await connect();
     await openSession(connection, { mcpServers: SERVERS, settings: { shareMcp: true } });
+    expect(notices(events, "mcp-config-failed")).toHaveLength(1);
+  });
+});
 
-    expect(readFileSync(configPath(), "utf8")).toBe("{ not json");
-    const notice = notices(events, "mcp-config-invalid")[0];
-    expect(notice).toMatchObject({ notice: { severity: "warning" } });
-    if (notice?.type === "session.notice") {
-      expect(notice.notice.description).toContain(configPath());
-    }
+describe("housekeeping", () => {
+  it("removes what a session that never came back left behind, when the plugin connects", async () => {
+    const dir = join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "attachments", "long-gone");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "1.png"), "png");
+    const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    utimesSync(dir, longAgo, longAgo);
+    const recent = join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "attachments", "yesterday");
+    mkdirSync(recent, { recursive: true });
 
-    // The session is still usable; only the sharing was skipped.
-    await prompt(connection, "hello");
-    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    await connect();
+
+    expect(existsSync(dir)).toBe(false);
+    expect(existsSync(recent)).toBe(true);
   });
 });
 
@@ -1911,6 +1949,39 @@ describe("history replay", () => {
     expect(replayed.filter((item) => item.type === "assistant_message").at(-1)).toMatchObject({
       text: "echo:hello\n",
     });
+  });
+
+  it("replays a tool call that was still running when the plugin went away as canceled", async () => {
+    process.env.FAKE_SCENARIO = "tool-hang";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "run it");
+    await waitFor(
+      () => timelineItems(events).find((item) => item.type === "tool_call" && item.status === "running"),
+      "the tool call to be running",
+    );
+    // The plugin goes away mid-turn: nothing settled the row that is still running.
+    await connection.close();
+
+    const replayed = timelineItems(await replay()).filter((item) => item.type === "tool_call");
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0]).toMatchObject({ status: "canceled" });
+  });
+
+  it("tells the user when the replay is only the most recent part of a long conversation", async () => {
+    const home = process.env.PASEO_HOME ?? "";
+    const dir = join(home, "plugin-data", "antigravity-cli", "transcripts");
+    mkdirSync(dir, { recursive: true });
+    const rows = Array.from({ length: MAX_ITEMS }, (_unused, index) =>
+      JSON.stringify({ type: "assistant_message", id: `a${index}`, text: `row ${index}` }),
+    );
+    // The store drops rows once it holds more than it keeps, and remembers that it did.
+    writeFileSync(join(dir, `${CONVERSATION_ID}.jsonl`), `${JSON.stringify({ truncated: true })}\n${rows.join("\n")}\n`);
+
+    const replayed = await replay();
+    const notice = replayed.find((event) => event.type === "session.notice" && event.notice.id === "history-truncated");
+    expect(notice).toMatchObject({ notice: { severity: "info", description: expect.stringContaining(String(MAX_ITEMS)) } });
+    expect(timelineItems(replayed)).toHaveLength(MAX_ITEMS);
   });
 
   it("stores nothing for a session that is not persisted", async () => {
@@ -3408,6 +3479,7 @@ describe("plan mode", () => {
 
 describe("when things go wrong", () => {
   const pidFile = () => join(tempDir, "agy.pid");
+  const mcpRoot = () => join(tempDir, "paseo-home", "plugin-data", "antigravity-cli", "mcp");
   const alive = (pid: number): boolean => {
     try {
       process.kill(pid, 0);
@@ -3488,14 +3560,14 @@ describe("when things go wrong", () => {
     await prompt(connection, "hello");
     await waitFor(() => events.find((event) => event.type === "session.persistence"), "the CLI to start");
     const pid = agyPid();
-    // A directory nobody may write to: removing the entries the plugin added cannot succeed.
-    chmodSync(join(tempDir, ".agents"), 0o500);
+    // A directory nobody may write to: removing the session's folder cannot succeed.
+    chmodSync(mcpRoot(), 0o500);
 
     await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
     expect(closed(events)).toBeDefined();
     expect(events.some((event) => event.type === "request.completed" && event.requestId === "close-1")).toBe(true);
     await waitFor(() => (alive(pid) ? undefined : true), "the CLI to be gone");
-    chmodSync(join(tempDir, ".agents"), 0o700);
+    chmodSync(mcpRoot(), 0o700);
   });
 
   it("stops every CLI when the connection closes, even if releasing an MCP entry fails", async () => {
@@ -3507,12 +3579,12 @@ describe("when things go wrong", () => {
     await prompt(connection, "hello");
     await waitFor(() => events.find((event) => event.type === "session.persistence"), "the CLI to start");
     const pid = agyPid();
-    // A directory nobody may write to: removing the entries the plugin added cannot succeed.
-    chmodSync(join(tempDir, ".agents"), 0o500);
+    // A directory nobody may write to: removing the session's folder cannot succeed.
+    chmodSync(mcpRoot(), 0o500);
 
     await connection.close();
     await waitFor(() => (alive(pid) ? undefined : true), "the CLI to be gone");
-    chmodSync(join(tempDir, ".agents"), 0o700);
+    chmodSync(mcpRoot(), 0o700);
   });
 
   it("does not hand a new turn to a CLI that is about to exit after an error", async () => {

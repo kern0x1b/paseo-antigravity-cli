@@ -54,8 +54,16 @@ import {
   type AgyStepUpdate,
   type AgyUsage,
 } from "./protocol";
-import { injectMcpServers, mcpConfigPath, releaseMcpServers, sweepMcpLedger } from "./mcp";
-import { pluginDataDir, unsafePathChars } from "./plugindata";
+import {
+  cleanUpLegacyMcpEntries,
+  mcpSessionConfigPath,
+  mcpSessionDir,
+  removeSessionMcpConfig,
+  sweepSessionMcpConfigs,
+  writeSessionMcpConfig,
+} from "./mcp";
+import { sweepPluginData } from "./housekeeping";
+import { pluginDataDir, safePathSegment } from "./plugindata";
 import { listConversations } from "./sessions";
 import { TranscriptReader, TranscriptTailer } from "./tail";
 import { openBackgroundTasks } from "./tasks";
@@ -66,7 +74,7 @@ import {
   type ChildRender,
   type TranscriptEntry,
 } from "./subagents";
-import { TranscriptStore, transcriptExists } from "./transcript";
+import { MAX_ITEMS, TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -141,6 +149,13 @@ export interface ProviderOptions {
   timing?: Partial<Timing>;
 }
 
+/**
+ * The sessions that are open, across every connection of this plugin process: what a sweep of the
+ * plugin's own files has to leave alone. A session belongs to the connection that opened it, but
+ * the files it wrote belong to the process.
+ */
+const liveSessions = new Set<string>();
+
 export function createProvider(options: ProviderOptions = {}): ProviderRegistration {
   const timing: Timing = { ...DEFAULT_TIMING, ...options.timing };
   return {
@@ -160,6 +175,13 @@ export function createProvider(options: ProviderOptions = {}): ProviderRegistrat
       if (!request.versions.includes(1)) {
         throw new Error("Antigravity provider requires provider protocol version 1");
       }
+      // Credentials a process that died without closing its sessions left behind, and what earlier
+      // versions wrote into workspaces, are taken back the first time anything connects.
+      await attempt("take back the old MCP entries", () => cleanUpLegacyMcpEntries());
+      await attempt("sweep the MCP folders", () => sweepSessionMcpConfigs(liveSessions));
+      await attempt("sweep the plugin's data", () =>
+        sweepPluginData({ live: liveSessions, retentionMs: timing.orphanRetentionMs }),
+      );
       return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES), timing);
     },
   };
@@ -203,9 +225,9 @@ interface Session {
   /** Number of images written for this session, so filenames stay unique within it. */
   attachmentCount: number;
   /**
-   * Where the workspace's `.agents/mcp_config.json` stands for this session: `applied` when the
-   * plugin's entries are in it, `error` when the last attempt failed and reported why, and
-   * `released` when nothing of this session's is (or should be) in it.
+   * Where the session's private MCP folder stands: `applied` when it holds the servers and is
+   * handed to the CLI, `error` when the last attempt to write it failed and reported why, and
+   * `released` when there is none (or should be none).
    */
   mcp: "applied" | "released" | "error";
   /**
@@ -505,6 +527,7 @@ function createConnection(capabilities: readonly ProviderCapability[], timing: T
         }
         session.follows.clear();
       }
+      for (const id of sessionIds) liveSessions.delete(id);
       state.sessions.clear();
       listeners.clear();
       // The rows of the last turn are still inside the debounce window, so flushing before the
@@ -514,7 +537,7 @@ function createConnection(capabilities: readonly ProviderCapability[], timing: T
       await Promise.allSettled(flushing.map((flush) => flush()));
       await Promise.allSettled(running.map((process) => process.dispose()));
       // A close without a session.close: entries this connection injected still belong to it.
-      await Promise.allSettled(sessionIds.map((id) => releaseMcpServers(id)));
+      await Promise.allSettled(sessionIds.map((id) => removeSessionMcpConfig(id)));
     },
   };
 }
@@ -639,7 +662,7 @@ async function openSession(
     process: null,
     needsRestart: false,
     // One file per session: rewritten before each schema turn, removed on close.
-    schemaPath: pluginDataDir("schemas", `${input.sessionId.replace(unsafePathChars, "_")}.json`),
+    schemaPath: pluginDataDir("schemas", `${safePathSegment(input.sessionId)}.json`),
     launchPending: { schema: false, commands: false, skillDir: null },
     launchActive: { schema: false, commands: false, skillDir: null },
     attachmentsDir,
@@ -667,6 +690,7 @@ async function openSession(
     planApproval: state.capabilities.includes("permission"),
   };
   state.sessions.set(input.sessionId, session);
+  liveSessions.add(input.sessionId);
 
   try {
     emit({
@@ -693,9 +717,9 @@ async function openSession(
     });
 
     await syncSessionMcp(session, emit);
-    // Leftovers from a process that died without releasing its entries: the ledger is the only
-    // record of them, and this is where the set of live sessions is known.
-    await sweepMcpLedger(new Set(state.sessions.keys()));
+    // Leftovers from a process that died without releasing its folders, and this is where the set
+    // of live sessions is known.
+    await sweepSessionMcpConfigs(liveSessions);
     if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
       emitNotice(
         session,
@@ -703,7 +727,7 @@ async function openSession(
         "mcp-unsupported",
         "warning",
         "MCP servers are not applied",
-        `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.`,
+        `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a directory it was given. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpSessionConfigPath(input.sessionId)}, a folder private to this session, or add them yourself with \`agy mcp add\`.`,
       );
     }
     if (addDirs.dropped.length > 0) {
@@ -739,6 +763,16 @@ async function openSession(
       );
     }
 
+    if (input.history === "replay" && session.transcript?.truncated) {
+      emitNotice(
+        session,
+        emit,
+        "history-truncated",
+        "info",
+        "Only the most recent history is shown",
+        `This conversation has more history than Paseo keeps. Only its most recent ${MAX_ITEMS} rows are shown here; Antigravity still has all of it, and the next reply continues the conversation.`,
+      );
+    }
     if (input.history === "replay" && session.transcript) {
       // A child's rows are replayed with the row that spawned it, before the parent announces
       // itself ready: a child session that arrived afterwards would be attached to a row the
@@ -764,6 +798,7 @@ async function openSession(
 async function abandonSession(state: ConnectionState, session: Session): Promise<void> {
   session.closing = true;
   state.sessions.delete(session.sessionId);
+  liveSessions.delete(session.sessionId);
   stopContinuation(session);
   for (const turn of session.pendingTurns) stopBackfill(turn);
   for (const follow of session.follows.values()) follow.transcript.stop();
@@ -774,7 +809,17 @@ async function abandonSession(state: ConnectionState, session: Session): Promise
   await Promise.allSettled(processes.map((process) => process.dispose()));
   await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
   await attempt("clear the attachments", () => clearAttachments(session.sessionId));
-  await attempt("release the MCP entries", () => releaseMcpServers(session.sessionId));
+  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId));
+}
+
+/**
+ * A tool call stored as running belongs to a turn that was cut short — the plugin went away, or
+ * was stopped, before anything settled it — and no process is left to finish it. Replayed as it was
+ * stored it would spin forever, so it is shown as what became of it: canceled.
+ */
+function settleStaleToolCall(item: ProviderTimelineItem): ProviderTimelineItem {
+  if (item.type !== "tool_call" || item.status !== "running") return item;
+  return { ...item, status: "canceled", error: null };
 }
 
 /** What a stored row knows about the child it spawned, as `refreshSubagentRow` wrote it. */
@@ -809,7 +854,7 @@ async function replayItem(
 ): Promise<void> {
   const info = readSubagentInfo(item);
   if (item.type !== "tool_call" || info === null || info.conversationId === undefined) {
-    emit({ type: "timeline.item", sessionId: session.sessionId, item });
+    emit({ type: "timeline.item", sessionId: session.sessionId, item: settleStaleToolCall(item) });
     return;
   }
   try {
@@ -954,39 +999,23 @@ async function prepareAttachmentsDir(sessionId: string): Promise<string | null> 
 }
 
 /**
- * Makes the workspace's `.agents/mcp_config.json` hold this session's servers exactly when the
- * sharing toggle is on. agy reads that file at startup, so this runs on the way to a launch: at
- * `session.open`, and at the start of a turn whose process is being replaced (the relaunch the
- * toggle raises). A failed attempt is reported once and left until the toggle is switched off and
- * on again, rather than re-reported on every turn.
+ * Makes the session's private MCP folder hold Paseo's servers exactly when the sharing toggle is
+ * on. agy reads the file at startup, so this runs on the way to a launch: at `session.open`, and at
+ * the start of a turn whose process is being replaced (the relaunch the toggle raises). A failed
+ * attempt is reported once and left until the toggle is switched off and on again, rather than
+ * re-reported on every turn.
  */
 async function syncSessionMcp(session: Session, emit: Emit): Promise<void> {
   const servers = session.config.mcpServers;
   if (!isSettingOn(session.settings.shareMcp) || Object.keys(servers).length === 0) {
     if (session.mcp === "released") return;
     session.mcp = "released";
-    await releaseMcpServers(session.sessionId);
+    await removeSessionMcpConfig(session.sessionId);
     return;
   }
   if (session.mcp !== "released") return;
 
-  const result = await injectMcpServers({
-    cwd: session.config.cwd,
-    sessionId: session.sessionId,
-    servers,
-  });
-  if (result.status === "invalid") {
-    session.mcp = "error";
-    emitNotice(
-      session,
-      emit,
-      "mcp-config-invalid",
-      "warning",
-      "Paseo tools were not shared",
-      `${result.path} exists but is not valid JSON, so it was left untouched. Fix or remove it, then turn sharing off and on again.`,
-    );
-    return;
-  }
+  const result = await writeSessionMcpConfig(session.sessionId, servers);
   if (result.status === "failed") {
     session.mcp = "error";
     emitNotice(
@@ -1000,14 +1029,13 @@ async function syncSessionMcp(session: Session, emit: Emit): Promise<void> {
     return;
   }
   session.mcp = "applied";
-  if (result.status === "unchanged") return;
   emitNotice(
     session,
     emit,
     "mcp-shared",
     "warning",
     "Paseo tools are shared with Antigravity",
-    `Antigravity loads Paseo's MCP servers from ${result.path}. That file holds the credentials those servers use (HTTP headers, or environment variables for stdio servers), so the plugin adds it to this repository's local git exclude — invisible to anyone else, and removed with the entries when the last Paseo session here closes. Outside a git work tree, keep .agents/mcp_config.json out of version control yourself.`,
+    `Antigravity loads Paseo's MCP servers from ${result.path}, in a folder that only this session's CLI is given, inside the plugin's own data directory and readable by you alone. That file holds the credentials those servers use (HTTP headers, or environment variables for stdio servers), and it is deleted when the session closes. Nothing is written into your workspace.`,
   );
 }
 
@@ -1868,6 +1896,7 @@ async function closeSession(
   session.deferred = [];
   for (const turn of session.pendingTurns) stopBackfill(turn);
   state.sessions.delete(input.sessionId);
+  liveSessions.delete(input.sessionId);
 
   // Children first — those being followed and those a replay re-opened with no tailer behind them
   // — and all of them before the parent's `session.closed`: nothing may be published for a child
@@ -1884,7 +1913,7 @@ async function closeSession(
   await Promise.allSettled([process?.dispose(), detached?.dispose()]);
   await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
   await attempt("clear the attachments", () => clearAttachments(session.sessionId));
-  await attempt("release the MCP entries", () => releaseMcpServers(session.sessionId));
+  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId));
 
   // Every child that settled already closed its own session and left this set, so what is left is
   // a child that was still running: closing it silently would tell the host it completed.
@@ -1925,6 +1954,7 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
       allowSlashCommands: session.launchPending.commands,
       attachmentDir: session.attachmentsDir ?? undefined,
       skillDir: session.launchPending.skillDir ?? undefined,
+      mcpDir: session.mcp === "applied" ? mcpSessionDir(session.sessionId) : undefined,
       extraArgs: session.extraArgs,
       binary: session.agyPath,
       terminateGraceMs: session.timing.terminateGraceMs,
@@ -2987,7 +3017,7 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
       description:
         Object.keys(session.config.mcpServers).length === 0
           ? "Paseo has no MCP servers configured for this session, so there is nothing to share."
-          : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config.cwd)} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
+          : `On writes Paseo's MCP servers as paseo-* entries into ${mcpSessionConfigPath(session.sessionId)}, a folder private to this session that Antigravity is given. That file holds their credentials, and is deleted when the session closes.`,
       value: onOff(session.settings.shareMcp),
       options: ON_OFF_OPTIONS,
     },
