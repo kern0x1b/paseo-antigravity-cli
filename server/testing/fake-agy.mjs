@@ -33,7 +33,8 @@
  *   FAKE_BACKGROUND_GATE file the `background` scenario waits for: the moment its task ends
  *   FAKE_BACKGROUND_END  what the `background` transcript says of its task: never (default) |
  *                        finish (ends at the gate, and the model carries on) | canceled (the
- *                        model cancels it before answering)
+ *                        model cancels it before answering) | trailing (notices after the answer)
+ *                        | error (the transcript ends on a model error) | error-recovers
  *   FAKE_BACKGROUND_FINAL_GATE  file `finish` waits for before the model's new final answer
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
@@ -557,10 +558,12 @@ readline.createInterface({ input }).on("line", async (line) => {
     // FAKE_BACKGROUND_END decides what the transcript says about the task: `never` (default) is a
     // dev server that never reports an end; `finish` is a test run whose end agy announces once the
     // gate opens, after which the model carries on — one tool call, then FAKE_BACKGROUND_FINAL_GATE,
-    // then a new final answer; `canceled` has the model cancel the task before it answers.
+    // then a new final answer; `canceled` has the model cancel the task before it answers;
+    // `trailing` writes a checkpoint and a notice after the final answer; `error` ends the
+    // transcript on a failed model call and `error-recovers` answers after one.
     const ending = process.env.FAKE_BACKGROUND_END ?? "never";
     const first = step;
-    step += ending === "finish" ? 9 : ending === "canceled" ? 4 : 5;
+    step += ending === "finish" ? 9 : ending === "canceled" ? 4 : ending === "trailing" ? 7 : ending === "error-recovers" ? 5 : ending === "error" ? 4 : 5;
     const command = { CommandLine: "npm start" };
     send(stepEvent(first, "DONE", "agent_response", { text_delta: "Starting the server." }));
     send(stepEvent(first + 1, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command } }));
@@ -576,12 +579,21 @@ readline.createInterface({ input }).on("line", async (line) => {
     const line = (stepIndex, source, type, status, extra) => ({ step_index: stepIndex, source, type, status, ...extra });
     const path = join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 
+    const modelError = (stepIndex, attempt) =>
+      line(stepIndex, "SYSTEM", "ERROR_MESSAGE", "DONE", {
+        error: `API error (attempt ${attempt}): RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h36m15s.`,
+        content: "",
+      });
+    const head = [
+      line(first - 1, "USER_EXPLICIT", "USER_INPUT", "DONE", { content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
+      line(first, "MODEL", "PLANNER_RESPONSE", "DONE", { content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] }),
+      line(first + 1, "MODEL", "GENERIC", "RUNNING", { content: started }),
+    ];
+
     if (ending === "canceled") {
       // The model stops the task itself, so agy's notice for it precedes the model's answer.
       await writeChildLines(path, [
-        line(first - 1, "USER_EXPLICIT", "USER_INPUT", "DONE", { content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
-        line(first, "MODEL", "PLANNER_RESPONSE", "DONE", { content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] }),
-        line(first + 1, "MODEL", "GENERIC", "RUNNING", { content: started }),
+        ...head,
         line(first + 2, "SYSTEM", "SYSTEM_MESSAGE", "DONE", { content: notice("LOW", `Task id "${taskId}" was canceled with result:\nTool execution was canceled\nLog: ${logDir}/task-${first + 1}.log`) }),
         line(first + 3, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `The server was stopped (${text}).` }),
       ].map((entry) => JSON.stringify(entry)));
@@ -592,13 +604,34 @@ readline.createInterface({ input }).on("line", async (line) => {
       return;
     }
 
+    if (ending === "error" || ending === "error-recovers") {
+      // agy's model call failed (a quota error, retried up to eight times) while the stream is
+      // still held behind the task: the transcript ends on the error and the result never comes.
+      // `error-recovers` is the retry that works: the model answers once the gate opens.
+      await writeChildLines(path, [...head, modelError(first + 2, 1), modelError(first + 3, 2)].map((entry) => JSON.stringify(entry)));
+      await waitForGate("FAKE_BACKGROUND_GATE");
+      if (ending === "error-recovers") {
+        await writeChildLines(path, [JSON.stringify(line(first + 4, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `Recovered (${text}).` }))]);
+        send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "started" } }));
+        send(stepEvent(first + 4, "DONE", "agent_response", { text_delta: `Recovered (${text}).` }));
+        sendResult(turnResult(turns, `Recovered (${text}).`));
+      }
+      return;
+    }
+
     const transcript = [
-      line(first - 1, "USER_EXPLICIT", "USER_INPUT", "DONE", { content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
-      line(first, "MODEL", "PLANNER_RESPONSE", "DONE", { content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] }),
-      line(first + 1, "MODEL", "GENERIC", "RUNNING", { content: started }),
+      ...head,
       line(first + 2, "MODEL", "PLANNER_RESPONSE", "DONE", { tool_calls: [{ name: "run_command", args: { CommandLine: encode("curl -s localhost:4719/health") } }] }),
       line(first + 3, "MODEL", "GENERIC", "DONE", { content: "The command exited with code 0.\nOutput:\nok" }),
       line(first + 4, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `The server is running (${text}).` }),
+      // What agy writes about the conversation after the answer must not take the answer away: a
+      // checkpoint, and a notice for a task that was canceled.
+      ...(ending === "trailing"
+        ? [
+            line(first + 5, "SYSTEM", "CHECKPOINT", "DONE", { content: "# Resuming from a compaction\n\nYou are continuing work on the task described above." }),
+            line(first + 6, "SYSTEM", "SYSTEM_MESSAGE", "DONE", { content: notice("LOW", `Task id "${taskId}" was canceled with result:\nTool execution was canceled`) }),
+          ]
+        : []),
     ];
     await writeChildLines(path, transcript.map((entry) => JSON.stringify(entry)));
 

@@ -70,29 +70,122 @@ describe("modelActed", () => {
   });
 });
 
+const ids = { message: (index: number) => `msg-${index}`, tool: (index: number) => `tool-${index}` };
+const render = (entries: TranscriptEntry[]) => renderBackfill(entries, ids, "/test");
+
 describe("renderBackfill", () => {
   it("renders assistant messages and tools from entries", () => {
-    const entries: TranscriptEntry[] = [
+    const rendered = render([
       entry({ stepIndex: 0, type: "USER_INPUT", content: "hello" }),
       entry({ stepIndex: 1, type: "PLANNER_RESPONSE", content: "Sure, let me check." }),
-      entry({
-        stepIndex: 2,
-        type: "PLANNER_RESPONSE",
-        content: "Done!",
-      }),
-    ];
-
-    const rendered = renderBackfill(
-      entries,
-      {
-        message: (idx) => `msg-${idx}`,
-        tool: (idx) => `tool-${idx}`,
-      },
-      "/test",
-    );
+      entry({ stepIndex: 2, type: "PLANNER_RESPONSE", content: "Done!" }),
+    ]);
 
     expect(rendered.rows.length).toBeGreaterThan(0);
     expect(rendered.finalStep).toBe(2);
     expect(rendered.finalText).toBe("Done!");
+  });
+
+  describe("the final answer", () => {
+    const answer = entry({ stepIndex: 5, type: "PLANNER_RESPONSE", status: "DONE", content: "All done." });
+
+    it("is the last planner response even when agy wrote a notice after it", () => {
+      const rendered = render([
+        answer,
+        entry({ stepIndex: 6, type: "SYSTEM_MESSAGE", status: "DONE", content: "[Message] sender=c/task-1" }),
+      ]);
+      expect(rendered.finalStep).toBe(5);
+      expect(rendered.finalText).toBe("All done.");
+    });
+
+    it("is not moved by a checkpoint or an error written after it", () => {
+      const rendered = render([
+        answer,
+        entry({ stepIndex: 6, type: "CHECKPOINT", status: "DONE", content: "# Resuming from a compaction" }),
+        entry({ stepIndex: 7, type: "ERROR_MESSAGE", status: "DONE", error: "API error (attempt 1)" }),
+      ]);
+      expect(rendered.finalStep).toBe(5);
+      expect(rendered.failure).toBeNull();
+    });
+
+    it("does not exist while the last planner response still has tool calls", () => {
+      const rendered = render([
+        entry({ stepIndex: 4, type: "PLANNER_RESPONSE", content: "Earlier text." }),
+        entry({
+          stepIndex: 5,
+          type: "PLANNER_RESPONSE",
+          content: "Running it.",
+          toolCalls: [{ name: "run_command", args: {} }],
+        }),
+      ]);
+      expect(rendered.finalStep).toBeNull();
+    });
+
+    it("does not exist when the last planner response has no text", () => {
+      const rendered = render([answer, entry({ stepIndex: 6, type: "PLANNER_RESPONSE", content: "" })]);
+      expect(rendered.finalStep).toBeNull();
+    });
+
+    it("is found whatever order the lines were written in", () => {
+      const rendered = render([
+        entry({ stepIndex: 7, type: "SYSTEM_MESSAGE", status: "DONE" }),
+        answer,
+        entry({ stepIndex: 3, type: "USER_INPUT", content: "go" }),
+      ]);
+      expect(rendered.finalStep).toBe(5);
+    });
+  });
+
+  describe("a failure", () => {
+    it("is an error that is the last word, with the message agy gave", () => {
+      const rendered = render([
+        entry({ stepIndex: 1, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: {} }] }),
+        entry({ stepIndex: 2, type: "GENERIC", status: "RUNNING", content: "Tool is running as a background task" }),
+        entry({ stepIndex: 3, type: "ERROR_MESSAGE", status: "DONE", error: "API error (attempt 8): RESOURCE_EXHAUSTED (code 429)" }),
+      ]);
+      expect(rendered.finalStep).toBeNull();
+      expect(rendered.failure).toEqual({ step: 3, message: "API error (attempt 8): RESOURCE_EXHAUSTED (code 429)" });
+    });
+
+    it("is none once the model has carried on after the error", () => {
+      const rendered = render([
+        entry({ stepIndex: 1, type: "ERROR_MESSAGE", status: "DONE", error: "model output error: retried" }),
+        entry({ stepIndex: 2, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: {} }] }),
+      ]);
+      expect(rendered.failure).toBeNull();
+    });
+  });
+
+  describe("a tool's row", () => {
+    const call = entry({
+      stepIndex: 1,
+      type: "PLANNER_RESPONSE",
+      toolCalls: [{ name: "run_command", args: { CommandLine: '"npm start"' } }],
+    });
+    const rowFor = (result?: TranscriptEntry) =>
+      render(result ? [call, result] : [call]).rows.find((row) => row.stepIndex === 2)?.item;
+
+    it("is running until its result is there", () => {
+      expect(rowFor()).toMatchObject({ type: "tool_call", status: "running" });
+    });
+
+    it("is running while agy still reports the result as RUNNING, as it does for a background command", () => {
+      expect(rowFor(entry({ stepIndex: 2, type: "GENERIC", status: "RUNNING", content: "started" }))).toMatchObject({
+        status: "running",
+      });
+    });
+
+    it("is completed at a DONE result", () => {
+      expect(rowFor(entry({ stepIndex: 2, type: "GENERIC", status: "DONE", content: "ok" }))).toMatchObject({
+        status: "completed",
+      });
+    });
+
+    it("is failed at an ERROR result, with what agy said", () => {
+      expect(rowFor(entry({ stepIndex: 2, type: "GENERIC", status: "ERROR", content: "permission denied" }))).toMatchObject({
+        status: "failed",
+        error: { message: "permission denied" },
+      });
+    });
   });
 });

@@ -30,6 +30,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createProvider } from "./provider";
+import type { Timing } from "./timing";
 import { parseTranscriptLines, renderChild } from "./subagents";
 import { writeConversationDb } from "./testing/conversation-db";
 
@@ -54,6 +55,8 @@ let argvFile: string;
 let argvLog: string;
 let promptFile: string;
 let openConnections: ProviderConnection[];
+/** The waits the provider under test works to; a case that follows a transcript shortens them. */
+let timing: Partial<Timing>;
 
 /**
  * What Paseo's own schemas would reject, as `direction path: message`.
@@ -110,6 +113,7 @@ beforeEach(() => {
   delete process.env.FAKE_SCENARIO;
   delete process.env.FAKE_MODELS_OK;
   openConnections = [];
+  timing = {};
 });
 
 afterEach(async () => {
@@ -144,8 +148,6 @@ afterEach(async () => {
     "FAKE_BACKGROUND_GATE",
     "FAKE_BACKGROUND_END",
     "FAKE_BACKGROUND_FINAL_GATE",
-    "PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS",
-    "PASEO_ANTIGRAVITY_POLL_MS",
   ]) {
     delete process.env[key];
   }
@@ -164,7 +166,7 @@ interface Harness {
 }
 
 async function connect(): Promise<Harness> {
-  const connection = await createProvider().connect({ versions: [1], capabilities: OFFERED });
+  const connection = await createProvider({ timing }).connect({ versions: [1], capabilities: OFFERED });
   openConnections.push(connection);
   return { connection, events: watchConnection(connection) };
 }
@@ -3044,11 +3046,12 @@ describe("background commands", () => {
    * `finish` a test run agy announces the end of and the model then carries on after, `canceled` a
    * task the model stops itself before it answers.
    */
-  function backgroundTurn(ending: "never" | "finish" | "canceled" = "never"): void {
+  function backgroundTurn(
+    ending: "never" | "finish" | "canceled" | "trailing" | "error" | "error-recovers" = "never",
+  ): void {
     process.env.FAKE_SCENARIO = "background";
     process.env.FAKE_BACKGROUND_END = ending;
-    process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
-    process.env.PASEO_ANTIGRAVITY_POLL_MS = "20";
+    timing = { backfillDelayMs: 50, transcriptPollMs: 20, failureQuietMs: 300 };
     process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
     process.env.FAKE_BACKGROUND_FINAL_GATE = join(tempDir, "background-final-gate");
     const home = join(tempDir, "home");
@@ -3195,6 +3198,73 @@ describe("background commands", () => {
     await prompt(connection, "start it");
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
     expect(backgroundNotices(events)).toEqual([]);
+  });
+
+  it("completes at the answer although agy wrote a checkpoint and a notice after it", async () => {
+    backgroundTurn("trailing");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    expect([...paseoView(events).messages.values()].at(-1)).toBe("The server is running (start it).");
+  });
+
+  it("fails a turn whose transcript ends on a model error that nothing followed", async () => {
+    backgroundTurn("error");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(failed).toMatchObject({
+      state: "failed",
+      error: { code: "agy_error", message: expect.stringContaining("RESOURCE_EXHAUSTED") },
+    });
+    expect(turns(events, "completed")).toEqual([]);
+    // The command the turn started is not left spinning under a turn that has ended.
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(new Map(calls.map((item) => [item.id, item.status])).get(calls[0]?.id ?? "")).toBe("failed");
+  });
+
+  it("does not fail a turn that the model answers after the error, which agy retried", async () => {
+    backgroundTurn("error-recovers");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    // Long enough for the error alone to have been read, well inside the time it takes to fail.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // A real delay past the time an error stays the last word: what is asserted is that the turn
+    // that already completed is not failed afterwards.
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(turns(events, "failed")).toEqual([]);
+    expect([...paseoView(events).messages.values()].at(-1)).toBe("Recovered (start it).");
+  });
+
+  it("fails the turn instead of hanging when the transcript cannot be read", async () => {
+    backgroundTurn("error");
+    timing = { ...timing, failureQuietMs: 60_000 };
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    const transcript = join(
+      tempDir,
+      "home",
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "11111111-2222-3333-4444-555555555555",
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    await waitFor(() => (existsSync(transcript) ? true : undefined), "the transcript to be written");
+    chmodSync(transcript, 0o000);
+
+    const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+    expect(failed).toMatchObject({ error: { code: "transcript_unreadable" } });
   });
 });
 

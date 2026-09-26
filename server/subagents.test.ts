@@ -346,4 +346,23 @@ describe("SubagentTranscript", () => {
     transcript.stop();
     rmSync(dir, { recursive: true, force: true });
   });
+  it("keeps following a child whose transcript has grown past 8 MiB", async () => {
+    const { dir, file } = tempTranscript();
+    const filler = "x".repeat(1000);
+    const bulk = Array.from({ length: 9_000 }, (_unused, index) => line(index + 1, "GENERIC", { content: filler }));
+    writeFileSync(
+      file,
+      `${line(0, "USER_INPUT", { content: "read the file" })}\n${bulk.join("\n")}\n${line(9_001, "PLANNER_RESPONSE", { content: "the last word" })}\n`,
+      "utf8",
+    );
+    const { transcript, published, degraded, firstRender } = harness(file);
+
+    transcript.start();
+    await firstRender;
+    transcript.stop();
+
+    expect(degraded).toEqual([]);
+    expect(published.flat()).toContain(`agy-sub:${CHILD}:9001:msg`);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

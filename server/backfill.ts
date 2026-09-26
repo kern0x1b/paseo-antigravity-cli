@@ -1,4 +1,3 @@
-import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
@@ -54,12 +53,23 @@ export interface Backfill {
   /** Every row the transcript justifies, in step order. */
   readonly rows: BackfillRow[];
   /**
-   * The step holding the conversation's final answer — a PLANNER_RESPONSE with text and no tool
-   * calls as the highest step so far — or null while it is still working.
+   * The step holding the conversation's final answer, or null while it is still working: the last
+   * PLANNER_RESPONSE, when it has text and no tool calls. What agy wrote after it about the
+   * conversation itself — a notice, a checkpoint, an error — does not take the answer away.
    */
   readonly finalStep: number | null;
   readonly finalText: string;
+  /**
+   * An error agy wrote and nothing followed: the last step is an ERROR_MESSAGE and the model has
+   * not answered since. agy retries a failed model call, so this is the last word only until
+   * something newer arrives; the caller decides how long to wait for that.
+   */
+  readonly failure: { readonly step: number; readonly message: string } | null;
 }
+
+/** The step types whose text is about the conversation, not something the model said or did. */
+const NOTICE_TYPES: ReadonlySet<string> = new Set(["SYSTEM_MESSAGE", "CHECKPOINT", "ERROR_MESSAGE"]);
+const ERROR_MESSAGE = "ERROR_MESSAGE";
 
 /** Renders a conversation transcript into rows keyed the way the stream keys the same steps. */
 export function renderBackfill(
@@ -98,25 +108,38 @@ export function renderBackfill(
         name: call.name,
         detail,
         metadata: { stepIndex, parameters: structuredClone(parameters) as JsonValue },
-        error: null,
       };
+      // The result's own status is the tool's: a command moved to the background reports its
+      // result as RUNNING and only the notice of its end says more, and a failed call says ERROR.
+      const running = output === undefined || result?.status === "RUNNING";
+      const failed = result?.status === "ERROR";
+      const message = output !== undefined && output.length > 0 ? output : "The tool reported an error";
       rows.push({
         stepIndex,
-        item: output === undefined ? { ...base, status: "running" } : { ...base, status: "completed" },
+        item: failed
+          ? { ...base, status: "failed", error: { message } }
+          : { ...base, status: running ? "running" : "completed", error: null },
       });
     });
   }
 
-  const last = sorted.at(-1);
+  const planner = sorted.findLast((entry) => entry.type === PLANNER_RESPONSE);
+  const after = planner === undefined ? sorted : sorted.filter((entry) => entry.stepIndex > planner.stepIndex);
   const done =
-    last !== undefined &&
-    last.type === PLANNER_RESPONSE &&
-    last.toolCalls.length === 0 &&
-    (last.content ?? "").trim().length > 0;
+    planner !== undefined &&
+    planner.toolCalls.length === 0 &&
+    (planner.content ?? "").trim().length > 0 &&
+    after.every((entry) => NOTICE_TYPES.has(entry.type));
+  const lastStep = sorted.at(-1);
+  const failure =
+    !done && lastStep !== undefined && lastStep.type === ERROR_MESSAGE
+      ? { step: lastStep.stepIndex, message: lastStep.error ?? "Antigravity reported an error" }
+      : null;
   return {
     rows,
-    finalStep: done ? last.stepIndex : null,
-    finalText: done ? (last.content ?? "") : "",
+    finalStep: done ? planner.stepIndex : null,
+    finalText: done ? (planner.content ?? "") : "",
+    failure,
   };
 }
 
@@ -141,67 +164,4 @@ export function stepsPast(entries: readonly TranscriptEntry[], settledStep: numb
  */
 export function modelActed(steps: readonly TranscriptEntry[]): boolean {
   return steps.some((entry) => entry.type === PLANNER_RESPONSE);
-}
-
-/** Poll period while a stream is stuck, or while a conversation may carry on after its turn. */
-const POLL_MS = 1_000;
-/** A transcript larger than this is not re-read on every tick. */
-const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
-
-/**
- * Re-reads one conversation transcript whenever it changes and hands its entries on. Started while
- * a turn has a tool that has not reported back, and stopped with that turn; or after a turn that
- * left its CLI detached, and stopped with that CLI.
- */
-export class TranscriptPoller {
-  private timer: NodeJS.Timeout | null = null;
-  private stopped = false;
-  private reading = false;
-  private lastStamp = "";
-
-  constructor(
-    private readonly path: string,
-    private readonly onEntries: (entries: readonly TranscriptEntry[]) => void,
-  ) {}
-
-  start(): void {
-    if (this.stopped || this.timer) return;
-    // The tests shorten the period; nothing else sets this.
-    const period = Number(process.env.PASEO_ANTIGRAVITY_POLL_MS) || POLL_MS;
-    this.timer = setInterval(() => void this.tick(), period);
-    this.timer.unref();
-    void this.tick();
-  }
-
-  stop(): void {
-    this.stopped = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  private async tick(): Promise<void> {
-    if (this.stopped || this.reading) return;
-    this.reading = true;
-    try {
-      const stats = await stat(this.path);
-      if (stats.size > MAX_TRANSCRIPT_BYTES) {
-        console.error(`[antigravity] not following ${this.path}: it is larger than 32 MiB`);
-        this.stop();
-        return;
-      }
-      const stamp = `${stats.size}:${stats.mtimeMs}`;
-      if (stamp === this.lastStamp) return;
-      this.lastStamp = stamp;
-      const text = await readFile(this.path, "utf8");
-      if (this.stopped) return;
-      this.onEntries(parseTranscriptLines(text).entries);
-    } catch (error) {
-      // Not written yet, or pruned: the next tick looks again.
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error(`[antigravity] could not read ${this.path}: ${String(error)}`);
-      }
-    } finally {
-      this.reading = false;
-    }
-  }
 }

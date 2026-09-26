@@ -1,8 +1,9 @@
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
+import { type TranscriptEntry, parseTranscriptLine } from "./entries";
+import { TranscriptReader } from "./tail";
 import { mapToolDetail } from "./tools";
 
 /**
@@ -30,96 +31,13 @@ const TRANSCRIPT_GENERIC = "GENERIC";
 /** The tool a child reports to its parent with; the parent conversation id is the recipient. */
 const SEND_MESSAGE = "send_message";
 
-export interface TranscriptToolCall {
-  readonly name: string;
-  readonly args: Record<string, unknown>;
-}
-
-export interface TranscriptEntry {
-  readonly stepIndex: number;
-  /** The line's `type`, exactly as written. */
-  readonly type: string;
-  /** The line's `status` (`DONE`, `RUNNING`, `ERROR`), when it has one. */
-  readonly status?: string;
-  /** Who wrote the step: `MODEL`, `SYSTEM` or `USER_EXPLICIT`. */
-  readonly source?: string;
-  readonly content?: string;
-  readonly toolCalls: readonly TranscriptToolCall[];
-}
-
-export interface ParsedTranscript {
-  /** In the order the steps were first seen; `renderChild` sorts them. */
-  readonly entries: TranscriptEntry[];
-  /** Complete lines that were not a JSON step, reported instead of thrown away silently. */
-  readonly malformed: number;
-}
-
-/**
- * Parses what a transcript holds right now. Only complete lines count: the last line of a file
- * being appended to is a write in progress, not a broken step.
- */
-export function parseTranscriptLines(text: string): ParsedTranscript {
-  // `split` never loses a trailing newline's emptiness: dropping the final element drops either
-  // that empty tail or the unterminated line itself.
-  const complete = text.split("\n").slice(0, -1);
-  const byStep = new Map<number, TranscriptEntry>();
-  let malformed = 0;
-
-  for (const line of complete) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
-    let decoded: unknown;
-    try {
-      decoded = JSON.parse(trimmed);
-    } catch {
-      malformed += 1;
-      continue;
-    }
-    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
-      malformed += 1;
-      continue;
-    }
-    const record = decoded as Record<string, unknown>;
-    const stepIndex = record.step_index;
-    const type = record.type;
-    if (typeof stepIndex !== "number" || !Number.isInteger(stepIndex)) {
-      malformed += 1;
-      continue;
-    }
-    if (typeof type !== "string" || type.length === 0) {
-      malformed += 1;
-      continue;
-    }
-    byStep.set(stepIndex, {
-      stepIndex,
-      type,
-      ...(typeof record.status === "string" ? { status: record.status } : {}),
-      ...(typeof record.source === "string" ? { source: record.source } : {}),
-      ...(typeof record.content === "string" ? { content: record.content } : {}),
-      toolCalls: readToolCalls(record.tool_calls),
-    });
-  }
-
-  return { entries: [...byStep.values()], malformed };
-}
-
-function readToolCalls(value: unknown): TranscriptToolCall[] {
-  if (!Array.isArray(value)) return [];
-  const calls: TranscriptToolCall[] = [];
-  for (const call of value) {
-    if (typeof call !== "object" || call === null || Array.isArray(call)) continue;
-    const record = call as Record<string, unknown>;
-    if (typeof record.name !== "string" || record.name.length === 0) continue;
-    const args = record.args;
-    calls.push({
-      name: record.name,
-      args: typeof args === "object" && args !== null && !Array.isArray(args)
-        ? (args as Record<string, unknown>)
-        : {},
-    });
-  }
-  return calls;
-}
+export {
+  parseTranscriptLine,
+  parseTranscriptLines,
+  type ParsedTranscript,
+  type TranscriptEntry,
+  type TranscriptToolCall,
+} from "./entries";
 
 export interface DecodedArgs {
   /** The call's parameters, without agy's own two bookkeeping keys. */
@@ -309,8 +227,6 @@ function childItemId(context: ChildContext, stepIndex: number, kind: string): st
   return `agy-sub:${context.childConversationId}:${stepIndex}:${kind}`;
 }
 
-/** A transcript larger than this is not re-read on every tick. */
-const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 /** Poll period. `fs.watch` says when to look; this covers an event that never arrived. */
 const POLL_MS = 500;
 /** How long a transcript that never yields a valid entry is followed before giving up on it. */
@@ -346,18 +262,20 @@ export class SubagentTranscript {
   private readonly published = new Map<string, string>();
   private readonly startedAt = Date.now();
   private lastGrowthAt = Date.now();
-  private lastStamp = "";
   private sawEntry = false;
   private malformedSeen = 0;
   private unknownSeen = "";
   /** Resolved once: a log_uri that is not a file URL can never be followed. */
   private readonly path: string | null;
+  /** Reads only what the child appended since the last tick. Null when there is no file to read. */
+  private readonly reader: TranscriptReader | null;
 
   constructor(
     private readonly config: SubagentTranscriptConfig,
     private readonly handlers: SubagentTranscriptHandlers,
   ) {
     this.path = transcriptFilePath(config.logUri);
+    this.reader = this.path === null ? null : new TranscriptReader(this.path);
   }
 
   start(): void {
@@ -412,9 +330,8 @@ export class SubagentTranscript {
     // That read may have found the child's last word, which stops the tailer; there is nothing
     // more to look at then.
     if (this.stopped) return;
-    // Otherwise one read of its own: the file is very likely unchanged since the last tick, and
-    // the point here is to publish what it holds now rather than to wait for it to move.
-    this.lastStamp = "";
+    // Otherwise one read of its own: what the child wrote since the last tick is published now
+    // rather than waiting for the next one.
     await this.read();
   }
 
@@ -436,59 +353,39 @@ export class SubagentTranscript {
   }
 
   private async readOnce(): Promise<void> {
-    const path = this.path;
-    if (path === null || this.stopped) return;
+    const reader = this.reader;
+    if (reader === null || this.stopped) return;
 
-    let size: number;
-    let mtimeMs: number;
+    let grew: boolean;
     try {
-      const stats = await stat(path);
-      size = stats.size;
-      mtimeMs = stats.mtimeMs;
-    } catch {
-      // Not there yet (or gone): the poll and the watch both bring us back.
-      this.checkBounds();
+      ({ grew } = await reader.read());
+    } catch (error) {
+      this.degrade(`its transcript could not be read: ${describe(error)}`);
       return;
     }
     // `stop` takes effect the moment it is called, including while this read was waiting: what a
     // stopped tailer has already begun to read is no longer anything it may publish.
     if (this.stopped) return;
 
-    if (size > MAX_TRANSCRIPT_BYTES) {
-      this.degrade(`its transcript grew past ${Math.round(MAX_TRANSCRIPT_BYTES / 1024 / 1024)} MiB`);
-      return;
-    }
-    const stamp = `${size}:${mtimeMs}`;
-    if (stamp === this.lastStamp) {
+    // Not there yet, or nothing new: the poll and the watch both bring us back.
+    if (!grew) {
       this.checkBounds();
       return;
     }
-    this.lastStamp = stamp;
     this.lastGrowthAt = Date.now();
-
-    let text: string;
-    try {
-      text = await readFile(path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      this.degrade(`its transcript could not be read: ${describe(error)}`);
-      return;
-    }
-    if (this.stopped) return;
-    this.publish(text);
+    this.publish(reader.entries(), reader.malformed);
     this.checkBounds();
   }
 
-  private publish(text: string): void {
-    const parsed = parseTranscriptLines(text);
-    if (parsed.malformed > this.malformedSeen) {
-      this.malformedSeen = parsed.malformed;
+  private publish(entries: readonly TranscriptEntry[], malformed: number): void {
+    if (malformed > this.malformedSeen) {
+      this.malformedSeen = malformed;
       console.error(
-        `[antigravity] ${parsed.malformed} unreadable line(s) in the subagent transcript ${this.config.childConversationId}`,
+        `[antigravity] ${malformed} unreadable line(s) in the subagent transcript ${this.config.childConversationId}`,
       );
     }
 
-    const render = renderChild(parsed.entries, this.config);
+    const render = renderChild(entries, this.config);
     const unknown = render.unknownTypes.join(", ");
     if (unknown.length > 0 && unknown !== this.unknownSeen) {
       this.unknownSeen = unknown;

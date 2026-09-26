@@ -20,13 +20,7 @@ import {
   type ProviderToolCallDetail,
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
-import {
-  TranscriptPoller,
-  conversationTranscriptPath,
-  modelActed,
-  renderBackfill,
-  stepsPast,
-} from "./backfill";
+import { conversationTranscriptPath, modelActed, renderBackfill, stepsPast } from "./backfill";
 import { AgyProcess } from "./agy";
 import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
@@ -63,7 +57,9 @@ import {
 import { injectMcpServers, mcpConfigPath, releaseMcpServers, sweepMcpLedger } from "./mcp";
 import { pluginDataDir, unsafePathChars } from "./plugindata";
 import { listConversations } from "./sessions";
+import { TranscriptReader, TranscriptTailer } from "./tail";
 import { openBackgroundTasks } from "./tasks";
+import { DEFAULT_TIMING, type Timing } from "./timing";
 import {
   SubagentTranscript,
   transcriptFilePath,
@@ -79,12 +75,6 @@ const PROVIDER_ID = "antigravity-cli";
 const STDERR_TAIL = 20;
 /** Whole files remembered per session for diffing, newest last. */
 const OBSERVED_LIMIT = 32;
-/**
- * How long a tool may stay ACTIVE before the conversation transcript is consulted. A command agy
- * moved to the background holds every later stream line until it ends (see `backfill.ts`).
- */
-const BACKFILL_DELAY_MS = 5_000;
-
 const PLAN_MODE_ID = "plan";
 /** The mode an approved plan is implemented in. */
 const IMPLEMENT_MODE_ID = "accept-edits";
@@ -146,7 +136,13 @@ const CAPABILITIES = [
   "permission.tool_policy",
 ] as const;
 
-export function createProvider(): ProviderRegistration {
+export interface ProviderOptions {
+  /** Overrides of the provider's waits and periods, for a caller that cannot wait seconds. */
+  timing?: Partial<Timing>;
+}
+
+export function createProvider(options: ProviderOptions = {}): ProviderRegistration {
+  const timing: Timing = { ...DEFAULT_TIMING, ...options.timing };
   return {
     id: PROVIDER_ID,
     label: "Antigravity",
@@ -164,13 +160,14 @@ export function createProvider(): ProviderRegistration {
       if (!request.versions.includes(1)) {
         throw new Error("Antigravity provider requires provider protocol version 1");
       }
-      return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES));
+      return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES), timing);
     },
   };
 }
 
 interface Session {
   readonly sessionId: string;
+  readonly timing: Timing;
   readonly config: ProviderSessionConfig;
   readonly agyPath?: string;
   readonly extraArgs?: readonly string[];
@@ -312,6 +309,8 @@ interface PendingTurn {
    * context had reached, as opposed to the result's total across every step of the turn.
    */
   contextInputTokens?: number;
+  /** Lowest step index the stream has delivered for this turn: where its part of the transcript starts. */
+  firstStep: number;
   /** Highest step index the stream has delivered for this turn. */
   lastStreamStep: number;
   /**
@@ -320,8 +319,10 @@ interface PendingTurn {
    * of them is dropped rather than published a second time.
    */
   readonly backfilled: Map<number, string>;
-  backfill: TranscriptPoller | null;
+  backfill: TranscriptTailer | null;
   backfillTimer: NodeJS.Timeout | null;
+  /** Runs while an error is the last word of the transcript; fails the turn if it stays that way. */
+  failureTimer: NodeJS.Timeout | null;
   /** The exact text written to agy, so a turn queued behind a detached CLI can be sent again. */
   outgoing: string;
   /** Sent in plan mode, so its answer is offered as a plan to implement. */
@@ -339,7 +340,7 @@ interface PendingTurn {
  * prompt behind it — from the first step where the model acts to its final answer.
  */
 interface Continuation {
-  readonly poller: TranscriptPoller;
+  readonly tailer: TranscriptTailer;
   /** Every step up to here is already published under some turn. */
   settledStep: number;
   /** The autonomous turn publishing the steps past `settledStep`, while one is open. */
@@ -441,14 +442,15 @@ interface TurnFailure {
 
 interface ConnectionState {
   capabilities: readonly ProviderCapability[];
+  timing: Timing;
   sessions: Map<string, Session>;
 }
 
 type Emit = (event: ProviderEvent) => void;
 
-function createConnection(capabilities: readonly ProviderCapability[]): ProviderConnection {
+function createConnection(capabilities: readonly ProviderCapability[], timing: Timing): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
-  const state: ConnectionState = { capabilities, sessions: new Map() };
+  const state: ConnectionState = { capabilities, timing, sessions: new Map() };
   let closed = false;
 
   const emit: Emit = (event) => {
@@ -605,6 +607,7 @@ async function openSession(
 
   const session: Session = {
     sessionId: input.sessionId,
+    timing: state.timing,
     config,
     agyPath: options.agyPath,
     extraArgs: options.extraArgs,
@@ -1117,10 +1120,12 @@ function createPendingTurn(session: Session, plan: boolean): PendingTurn {
     // Replaced with the launch profile of the process that actually serves the turn: a turn queued
     // behind another is answered by that process, not by the one its own prompt implies.
     schema: false,
+    firstStep: -1,
     lastStreamStep: -1,
     backfilled: new Map(),
     backfill: null,
     backfillTimer: null,
+    failureTimer: null,
     outgoing: "",
     plan,
   };
@@ -1308,8 +1313,7 @@ async function releaseDetached(session: Session): Promise<void> {
  */
 function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit): void {
   if (turn.backfill || turn.backfillTimer) return;
-  // The tests shorten the wait; nothing else sets this.
-  const delay = Number(process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS) || BACKFILL_DELAY_MS;
+  const delay = session.timing.backfillDelayMs;
   turn.backfillTimer = setTimeout(() => {
     turn.backfillTimer = null;
     const conversationId = session.conversationId;
@@ -1319,8 +1323,17 @@ function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit): void
     console.log(
       `[antigravity] a tool has been running for ${delay / 1000}s; following the conversation transcript`,
     );
-    turn.backfill = new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
-      applyBackfill(session, turn, entries, emit),
+    // Only this turn's steps are needed, and the file holds every turn of the conversation.
+    const reader = new TranscriptReader(conversationTranscriptPath(conversationId), {
+      fromStep: Math.max(turn.firstStep, 0),
+    });
+    turn.backfill = new TranscriptTailer(
+      reader,
+      {
+        onChange: (entries) => applyBackfill(session, turn, entries, emit),
+        onError: (reason) => failTurnFromTranscript(session, turn, emit, reason),
+      },
+      session.timing.transcriptPollMs,
     );
     turn.backfill.start();
   }, delay);
@@ -1330,19 +1343,22 @@ function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit): void
 function stopBackfill(turn: PendingTurn): void {
   if (turn.backfillTimer) clearTimeout(turn.backfillTimer);
   turn.backfillTimer = null;
+  if (turn.failureTimer) clearTimeout(turn.failureTimer);
+  turn.failureTimer = null;
   turn.backfill?.stop();
   turn.backfill = null;
 }
 
 /**
  * Publishes the steps the transcript holds and the stream has not delivered, and settles the turn
- * once the transcript shows its final answer. A step the stream already delivered stays the
- * stream's; a step published here stays this function's, whatever the stream sends later.
+ * once the transcript shows its final answer, or once an error has been its last word for
+ * `failureQuietMs`. A step the stream already delivered stays the stream's; a step published here
+ * stays this function's, whatever the stream sends later.
  */
 function applyBackfill(
   session: Session,
   turn: PendingTurn,
-  entries: Parameters<typeof renderBackfill>[0],
+  entries: readonly TranscriptEntry[],
   emit: Emit,
 ): void {
   if (session.closing || session.pendingTurns[0] !== turn) {
@@ -1358,8 +1374,43 @@ function applyBackfill(
     session.config.cwd,
   );
   publishTranscriptRows(session, emit, turn, render.rows);
-  if (render.finalStep === null || !turn.backfilled.has(render.finalStep)) return;
-  settleFromTranscript(session, turn, emit, render.finalStep, entries);
+  if (turn.failureTimer) clearTimeout(turn.failureTimer);
+  turn.failureTimer = null;
+  if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
+    settleFromTranscript(session, turn, emit, {
+      status: "completed",
+      finalStep: render.finalStep,
+      entries,
+    });
+    return;
+  }
+  // agy retries a failed model call, so an error is only the end once nothing has followed it.
+  const failure = render.failure;
+  if (failure === null) return;
+  turn.failureTimer = setTimeout(() => {
+    turn.failureTimer = null;
+    if (session.closing || session.pendingTurns[0] !== turn) return;
+    settleFromTranscript(session, turn, emit, {
+      status: "failed",
+      step: failure.step,
+      error: { message: failure.message, code: "agy_error" },
+    });
+  }, session.timing.failureQuietMs);
+  turn.failureTimer.unref();
+}
+
+/** The transcript of a stream-held turn cannot be read, so its answer will never be seen. */
+function failTurnFromTranscript(session: Session, turn: PendingTurn, emit: Emit, reason: string): void {
+  if (session.closing || session.pendingTurns[0] !== turn) return;
+  console.error(`[antigravity] ${reason}`);
+  settleFromTranscript(session, turn, emit, {
+    status: "failed",
+    step: session.settledStep,
+    error: {
+      message: `Antigravity's conversation transcript could not be followed: ${reason}`,
+      code: "transcript_unreadable",
+    },
+  });
 }
 
 /** Publishes the transcript's rows a turn does not have yet, and tracks them as that turn's. */
@@ -1394,36 +1445,51 @@ function publishTranscriptRows(
   }
 }
 
+/** How a turn whose result only the transcript has ended. */
+type Settlement =
+  | { status: "completed"; finalStep: number; entries: readonly TranscriptEntry[] }
+  | { status: "failed"; step: number; error: ProviderError };
+
 /**
- * Completes a turn whose answer only the transcript has. The CLI serving it still owes that turn's
+ * Ends a turn whose outcome only the transcript has. The CLI serving it still owes that turn's
  * `result`, and will not read another line until its background task ends, so it is detached:
  * nothing it prints is used any more, and a fresh CLI resumes the conversation for the next turn.
  *
- * The answer is final for this turn, as any answer is. If a task the turn started ends later and
- * agy wakes the model, what it does then is published as a turn of its own (see `Continuation`).
+ * A completed answer is final for this turn, as any answer is. If a task the turn started ends
+ * later and agy wakes the model, what it does then is published as a turn of its own (see
+ * `Continuation`). A failed turn has no such afterlife: agy exits after an error, so its CLI is
+ * released.
  */
-function settleFromTranscript(
-  session: Session,
-  turn: PendingTurn,
-  emit: Emit,
-  finalStep: number,
-  entries: readonly TranscriptEntry[],
-): void {
+function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit, settlement: Settlement): void {
   stopBackfill(turn);
-  session.settledStep = Math.max(session.settledStep, finalStep);
+  const step = settlement.status === "completed" ? settlement.finalStep : settlement.step;
+  session.settledStep = Math.max(session.settledStep, step);
   const queued = session.pendingTurns.filter((pending) => pending !== turn);
   session.pendingTurns = [];
-  console.log(
-    `[antigravity] settled ${turn.turnId} from the conversation transcript; the CLI is still held by a background task`,
-  );
-  finalizeToolCalls(session, emit, turn, { status: "completed" });
-  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
-  offerPlan(session, emit, turn, lastAssistantText(turn));
+  console.log(`[antigravity] settled ${turn.turnId} (${settlement.status}) from the conversation transcript`);
 
   const stuck = session.process;
   session.process = null;
-  if (stuck) detachProcess(session, emit, stuck);
-  if (openBackgroundTasks(entries, finalStep).size > 0) emitBackgroundTaskNotice(session, emit);
+  if (settlement.status === "failed") {
+    finalizeToolCalls(session, emit, turn, { status: "failed", error: settlement.error });
+    emit({
+      type: "session.turn",
+      sessionId: session.sessionId,
+      turnId: turn.turnId,
+      state: "failed",
+      error: settlement.error,
+    });
+    void settleChildFollows(session, emit, turn, { state: "failed", error: settlement.error });
+    if (stuck) void stuck.dispose();
+  } else {
+    finalizeToolCalls(session, emit, turn, { status: "completed" });
+    emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+    offerPlan(session, emit, turn, lastAssistantText(turn));
+    if (stuck) detachProcess(session, emit, stuck);
+    if (openBackgroundTasks(settlement.entries, settlement.finalStep).size > 0) {
+      emitBackgroundTaskNotice(session, emit);
+    }
+  }
   // Turns written behind the settled one were queued inside the detached CLI and would never run
   // there, so they go to the fresh one instead. Their `started` was already announced.
   if (queued.length > 0) void resendQueued(session, emit, queued);
@@ -1461,21 +1527,56 @@ function detachProcess(session: Session, emit: Emit, process: AgyProcess): void 
   session.detached = process;
   const conversationId = session.conversationId;
   if (conversationId === null || session.closing) return;
+  // What the model does from here on is all that is read: everything up to the settled step is
+  // already published.
+  const reader = new TranscriptReader(conversationTranscriptPath(conversationId), {
+    fromStep: session.settledStep + 1,
+  });
   const continuation: Continuation = {
-    poller: new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
-      applyContinuation(session, emit, continuation, entries),
+    tailer: new TranscriptTailer(
+      reader,
+      {
+        onChange: (entries) => applyContinuation(session, emit, continuation, entries),
+        onError: (reason) => handleContinuationError(session, emit, continuation, reason),
+      },
+      session.timing.transcriptPollMs,
     ),
     settledStep: session.settledStep,
     turn: null,
   };
   session.continuation = continuation;
-  continuation.poller.start();
+  continuation.tailer.start();
 }
 
 /** Stops following the detached CLI's conversation. An open continuation is settled by the caller. */
 function stopContinuation(session: Session): void {
-  session.continuation?.poller.stop();
+  session.continuation?.tailer.stop();
   session.continuation = null;
+}
+
+/**
+ * The transcript of the detached CLI cannot be read, so nothing more of what the model does can be
+ * shown. A turn already open is failed, because its answer will never be seen; otherwise the
+ * conversation simply stops being followed until the next prompt.
+ */
+function handleContinuationError(
+  session: Session,
+  emit: Emit,
+  continuation: Continuation,
+  reason: string,
+): void {
+  if (session.closing || session.continuation !== continuation) return;
+  console.error(`[antigravity] ${reason}`);
+  const turn = continuation.turn;
+  continuation.turn = null;
+  if (turn === null) return;
+  const error: ProviderError = {
+    message: `Antigravity's conversation transcript could not be followed: ${reason}`,
+    code: "transcript_unreadable",
+  };
+  finalizeToolCalls(session, emit, turn, { status: "failed", error });
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "failed", error });
+  if (session.deferred.length > 0) void sendDeferred(session, emit);
 }
 
 /**
@@ -1801,6 +1902,7 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
     // stream's own copy now would only repeat it, and an assistant row would repeat its text.
     if (turn.backfilled.has(step.step_index)) return;
     if (step.step_index > turn.lastStreamStep) turn.lastStreamStep = step.step_index;
+    if (turn.firstStep < 0 || step.step_index < turn.firstStep) turn.firstStep = step.step_index;
   }
 
   if (step.step_type === STEP_AGENT_RESPONSE) {
