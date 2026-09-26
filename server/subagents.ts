@@ -2,7 +2,7 @@ import { existsSync, watch, type FSWatcher } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
-import { type TranscriptEntry, parseTranscriptLine } from "./entries";
+import { type TranscriptEntry } from "./entries";
 import { TranscriptReader } from "./tail";
 import { mapToolDetail } from "./tools";
 

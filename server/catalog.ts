@@ -12,7 +12,7 @@ import { resolveAgyBinary } from "./agy";
 const execFileAsync = promisify(execFile);
 
 /** The flash family, whose default tier is the model the CLI prefers out of the box. */
-export const DEFAULT_MODEL_ID = "gemini-3.8-flash";
+const DEFAULT_MODEL_ID = "gemini-3.8-flash";
 export const DEFAULT_MODE_ID = "default";
 
 /** The tier a family defaults to when it has one, as `agy models` lists it first. */
@@ -58,7 +58,7 @@ const FALLBACK_MODELS_OUTPUT = [
   "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)",
 ].join("\n");
 
-export const FALLBACK_MODELS: readonly ProviderModel[] = groupModels(
+const FALLBACK_MODELS: readonly ProviderModel[] = groupModels(
   parseModels(FALLBACK_MODELS_OUTPUT),
 );
 
@@ -169,7 +169,7 @@ function splitTier(id: string): { base: string; tier: Tier } | null {
  * (`gpt-oss-120b-medium`, `claude-opus-4-6-thinking`), and a persisted full slug still launches
  * unchanged through `resolveThinking`.
  */
-export function groupModels(rows: readonly ProviderModel[]): readonly ProviderModel[] {
+function groupModels(rows: readonly ProviderModel[]): readonly ProviderModel[] {
   const families = new Map<string, Set<Tier>>();
   for (const row of rows) {
     const split = splitTier(row.id);

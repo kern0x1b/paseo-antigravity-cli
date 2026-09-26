@@ -20,7 +20,7 @@ const EXTENSIONS: Record<string, string> = {
 };
 
 /** The largest image a prompt may attach. A picture is a few megabytes; past this it is not one. */
-export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 /**
  * Writes one decoded image part and returns the absolute path the prompt must point at. The folder

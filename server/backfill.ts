@@ -1,10 +1,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
-import { decodeArgs, parseTranscriptLines, type TranscriptEntry } from "./subagents";
+import type { JsonValue } from "./json";
+import { decodeArgs, type TranscriptEntry } from "./subagents";
 import { mapToolDetail } from "./tools";
-
-type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 /**
  * Recovers a turn whose stream-json output agy has stopped delivering.

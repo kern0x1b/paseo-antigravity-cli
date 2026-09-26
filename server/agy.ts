@@ -60,7 +60,7 @@ export interface AgyProcessHandlers {
  * inherit the directories a shell adds, which is where the installer (`~/.local/bin`) and Homebrew
  * (`/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel) put it.
  */
-export function defaultBinaryDirs(): string[] {
+function defaultBinaryDirs(): string[] {
   return [join(homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
 }
 
@@ -76,7 +76,7 @@ export function resolveAgyBinary(explicit?: string, dirs: readonly string[] = de
   return "agy";
 }
 
-export function buildAgyArgs(config: AgyLaunchConfig): string[] {
+function buildAgyArgs(config: AgyLaunchConfig): string[] {
   const args = [
     "--input-format",
     "stream-json",
@@ -118,9 +118,9 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
 /** How long an interrupted process may take to report `interrupted` before it is killed. */
 const SIGKILL_GRACE_MS = 5_000;
 /** How long a process asked to stop may take to flush and exit before it is killed. */
-export const TERMINATE_GRACE_MS = 3_000;
+const TERMINATE_GRACE_MS = 3_000;
 /** How long the exit of a process waits for its output pipes to end. */
-export const DRAIN_GRACE_MS = 2_000;
+const DRAIN_GRACE_MS = 2_000;
 
 /**
  * One `agy` child process speaking NDJSON on stdin/stdout. A single process serves a whole

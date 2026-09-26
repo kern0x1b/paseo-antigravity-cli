@@ -13,7 +13,11 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
     "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.9.1",
@@ -21,6 +25,9 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.6",
     "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "@getpaseo/plugin": ">=0.9.1"
   },
   "description": "Antigravity CLI (agy) as a Paseo provider: streaming turns, tool rows with diffs, images, structured output, skills and slash commands, conversation import, and opt-in MCP sharing.",
   "license": "MIT",

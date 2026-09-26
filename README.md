@@ -6,8 +6,9 @@ protocol. Nothing about Antigravity is reimplemented — this plugin spawns the 
 already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
-- Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9 for the behaviour described below.
+- Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 or later for the plugin process,
+  and Antigravity CLI 1.2.11 (developed against; the probes noted below were taken with 1.2.9
+  through 1.2.11, and each note says which).
 
 ## Install
 
@@ -278,6 +279,31 @@ The plugin reads three things outside those directories: the `toolPermission` va
 `~/.gemini/antigravity-cli/settings.json` (so the approval select can name it), the
 conversation index `~/.gemini/antigravity-cli/conversation_summaries.db` (read-only, for session
 import), and, while a subagent runs, the transcript file agy names for it (read-only).
+
+## Code map
+
+Everything lives in `server/`; `index.server.ts` registers `createProvider()` from `provider.ts`.
+
+| Module | Responsibility |
+|---|---|
+| `provider.ts` | `createProvider`: the registration, and what runs when a connection is made. |
+| `connection.ts` | One host connection: admitting inputs, dispatching them to sessions, closing everything. |
+| `lifecycle.ts` / `replay.ts` | Opening (and undoing a failed open of) a session, closing one; republishing stored rows. |
+| `turns.ts` / `plan.ts` | Prompts and turns, interrupts and configuration; plan-mode approval. |
+| `process.ts` / `stream.ts` / `turn-end.ts` | The CLI process of a session; turning its stream into rows and results; ending a turn without an answer. |
+| `background.ts` | A stream held by a background task: following the transcript, settling the turn from it, autonomous turns. |
+| `subagent-follow.ts` / `subagents.ts` | Subagent rows and each child's own transcript as a session; the child transcript renderer. |
+| `tail.ts` / `entries.ts` / `backfill.ts` / `tasks.ts` | Following transcripts by byte offset; one transcript step; rendering steps into rows; reading tasks from them. |
+| `agy.ts` / `protocol.ts` | The `agy` child process (process group, teardown); decoding its NDJSON. |
+| `state.ts` / `constants.ts` / `timing.ts` / `settings.ts` | Session and turn types; fixed values; injectable waits; the composer's settings. |
+| `mcp.ts` / `archive.ts` / `housekeeping.ts` / `transcript.ts` / `attachments.ts` | Files the plugin writes and how they are kept private and cleaned up. |
+| `catalog.ts` / `commands.ts` / `sessions.ts` / `tools.ts` / `edits.ts` | Models and modes; slash commands and skills; the conversation index; tool rows; edit diffs. |
+
+`npm run typecheck`, `npm run lint` (typecheck with unused code as errors) and `npm test` are what
+CI runs. There is no build step: the plugin ships its TypeScript source. The tests run the plugin
+against `server/testing/fake-agy.mjs`, whose transcript lines are checked against a capture of real
+agy output (`fixtures/13-background-tasks.transcript.jsonl`). What this plugin needs from Paseo and
+agy that it cannot do itself is in [`docs/paseo-changes-needed.md`](docs/paseo-changes-needed.md).
 
 ## Known limitations
 

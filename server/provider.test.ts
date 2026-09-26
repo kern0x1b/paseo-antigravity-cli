@@ -2670,7 +2670,7 @@ describe("subagents", () => {
   }
 
   /** The child session of one subagent row, as the row links to it. */
-  function childIdOf(events: ProviderEvent[], conversationId = CHILD_A): string {
+  function childIdOf(_events: ProviderEvent[], conversationId = CHILD_A): string {
     return `session-1:subagent:${conversationId}`;
   }
 

@@ -112,10 +112,8 @@ export type AgyEvent =
   | { kind: "malformed"; event: string; reason: string };
 
 /** Values seen for `step_update.step_type`. Treated as data, never as a closed enum. */
-export const STEP_USER_INPUT = "user_input";
 export const STEP_AGENT_RESPONSE = "agent_response";
 export const STEP_TOOL = "tool";
-export const STEP_SYSTEM_MESSAGE = "system_message";
 /**
  * The step agy reports once the `invoke_subagent` call it shares a `step_index` with has been
  * dispatched. It is the same step as the tool line, carrying `subagent_info` in place of
@@ -123,11 +121,10 @@ export const STEP_SYSTEM_MESSAGE = "system_message";
  */
 export const STEP_SUBAGENT = "subagent";
 
-export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";
 
 /** agy reports an interrupted turn as a failed result carrying this exact error string. */
-export const INTERRUPTED_ERROR = "interrupted";
+const INTERRUPTED_ERROR = "interrupted";
 
 /**
  * The structured line agy 1.2.6+ documents as `AGY_ERROR: {...}` on stderr for a turn that ends on
