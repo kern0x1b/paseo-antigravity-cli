@@ -32,7 +32,8 @@
  *   FAKE_TOOL_END        how `tool-hang` ends the turn: interrupt (default) | error | die
  *   FAKE_BACKGROUND_GATE file the `background` scenario waits for: the moment its task ends
  *   FAKE_BACKGROUND_END  what the `background` transcript says of its task: never (default) |
- *                        finish (ends at the gate, and the model carries on) | unmarked
+ *                        finish (ends at the gate, and the model carries on) | canceled (the
+ *                        model cancels it before answering)
  *   FAKE_BACKGROUND_FINAL_GATE  file `finish` waits for before the model's new final answer
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
@@ -549,43 +550,70 @@ readline.createInterface({ input }).on("line", async (line) => {
     // finishes in its own transcript. Everything after it — and the result — is held until the
     // task ends, which here is when the test writes FAKE_BACKGROUND_GATE.
     //
+    // The transcript lines have the shapes real agy writes (fixtures/13-background-tasks.*): the
+    // task's start is a GENERIC step that stays RUNNING, and whatever agy tells the model about a
+    // task is a SYSTEM_MESSAGE whose `[Message]` header names the task as its sender.
+    //
     // FAKE_BACKGROUND_END decides what the transcript says about the task: `never` (default) is a
     // dev server that never reports an end; `finish` is a test run whose end agy announces once the
     // gate opens, after which the model carries on — one tool call, then FAKE_BACKGROUND_FINAL_GATE,
-    // then a new final answer; `unmarked` starts the task under wording the plugin does not know.
+    // then a new final answer; `canceled` has the model cancel the task before it answers.
     const ending = process.env.FAKE_BACKGROUND_END ?? "never";
     const first = step;
-    step += ending === "finish" ? 9 : 5;
+    step += ending === "finish" ? 9 : ending === "canceled" ? 4 : 5;
     const command = { CommandLine: "npm start" };
     send(stepEvent(first, "DONE", "agent_response", { text_delta: "Starting the server." }));
     send(stepEvent(first + 1, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command } }));
 
     const encode = (value) => JSON.stringify(value);
-    const started =
-      ending === "unmarked" ? "Tool is still running." : "Tool is running as a background task with task id: task-1";
-    const transcript = [
-      { step_index: first - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` },
-      { step_index: first, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] },
-      { step_index: first + 1, source: "MODEL", type: "GENERIC", status: "DONE", content: started },
-      { step_index: first + 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command", args: { CommandLine: encode("curl -s localhost:4719/health") } }] },
-      { step_index: first + 3, source: "MODEL", type: "GENERIC", status: "DONE", content: "The command exited with code 0.\nOutput:\nok" },
-      { step_index: first + 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `The server is running (${text}).` },
-    ];
+    const taskId = `${conversationId}/task-${first + 1}`;
+    const logDir = `file://${join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "tasks")}`;
+    const started = `Created At: 2026-09-26T14:22:46+02:00\nTool is running as a background task with task id: ${taskId}\nTask Description: npm start\nTask logs are available at: ${logDir}/task-${first + 1}.log\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE.`;
+    // What agy tells the model when a task ends or a timer fires: a system message whose header
+    // names the task, in its envelope.
+    const notice = (priority, content) =>
+      `The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-09-26T12:23:40Z sender=${taskId} priority=MESSAGE_PRIORITY_${priority} content=${content}\n</SYSTEM_MESSAGE>`;
+    const line = (stepIndex, source, type, status, extra) => ({ step_index: stepIndex, source, type, status, ...extra });
     const path = join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
-    await writeChildLines(path, transcript.map((line) => JSON.stringify(line)));
+
+    if (ending === "canceled") {
+      // The model stops the task itself, so agy's notice for it precedes the model's answer.
+      await writeChildLines(path, [
+        line(first - 1, "USER_EXPLICIT", "USER_INPUT", "DONE", { content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
+        line(first, "MODEL", "PLANNER_RESPONSE", "DONE", { content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] }),
+        line(first + 1, "MODEL", "GENERIC", "RUNNING", { content: started }),
+        line(first + 2, "SYSTEM", "SYSTEM_MESSAGE", "DONE", { content: notice("LOW", `Task id "${taskId}" was canceled with result:\nTool execution was canceled\nLog: ${logDir}/task-${first + 1}.log`) }),
+        line(first + 3, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `The server was stopped (${text}).` }),
+      ].map((entry) => JSON.stringify(entry)));
+      await waitForGate("FAKE_BACKGROUND_GATE");
+      send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "started" } }));
+      send(stepEvent(first + 3, "DONE", "agent_response", { text_delta: `The server was stopped (${text}).` }));
+      sendResult(turnResult(turns, `The server was stopped (${text}).`));
+      return;
+    }
+
+    const transcript = [
+      line(first - 1, "USER_EXPLICIT", "USER_INPUT", "DONE", { content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
+      line(first, "MODEL", "PLANNER_RESPONSE", "DONE", { content: "Starting the server.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm start"), toolSummary: encode("Start server") } }] }),
+      line(first + 1, "MODEL", "GENERIC", "RUNNING", { content: started }),
+      line(first + 2, "MODEL", "PLANNER_RESPONSE", "DONE", { tool_calls: [{ name: "run_command", args: { CommandLine: encode("curl -s localhost:4719/health") } }] }),
+      line(first + 3, "MODEL", "GENERIC", "DONE", { content: "The command exited with code 0.\nOutput:\nok" }),
+      line(first + 4, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `The server is running (${text}).` }),
+    ];
+    await writeChildLines(path, transcript.map((entry) => JSON.stringify(entry)));
 
     await waitForGate("FAKE_BACKGROUND_GATE");
     if (ending === "finish") {
       // agy wakes the model with a SYSTEM_MESSAGE when the task ends, and the model carries on in
       // this same process; the steps land in the transcript long before the stream catches up.
       await writeChildLines(path, [
-        { step_index: first + 5, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: 'Task id "task-1" finished with result:\nOutput: ok' },
-        { step_index: first + 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command", args: { CommandLine: encode("git push") } }] },
-        { step_index: first + 7, source: "MODEL", type: "GENERIC", status: "DONE", content: "The command exited with code 0.\nOutput:\npushed" },
-      ].map((line) => JSON.stringify(line)));
+        line(first + 5, "SYSTEM", "SYSTEM_MESSAGE", "DONE", { content: notice("HIGH", `Task id "${taskId}" finished with result:\n\nThe command exited with code 0.\nOutput: ok\nLog: ${logDir}/task-${first + 1}.log`) }),
+        line(first + 6, "MODEL", "PLANNER_RESPONSE", "DONE", { tool_calls: [{ name: "run_command", args: { CommandLine: encode("git push") } }] }),
+        line(first + 7, "MODEL", "GENERIC", "DONE", { content: "The command exited with code 0.\nOutput:\npushed" }),
+      ].map((entry) => JSON.stringify(entry)));
       await waitForGate("FAKE_BACKGROUND_FINAL_GATE");
       await writeChildLines(path, [
-        JSON.stringify({ step_index: first + 8, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `The checks passed and the branch is pushed (${text}).` }),
+        JSON.stringify(line(first + 8, "MODEL", "PLANNER_RESPONSE", "DONE", { content: `The checks passed and the branch is pushed (${text}).` })),
       ]);
     }
     send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "started" } }));

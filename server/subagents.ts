@@ -39,6 +39,10 @@ export interface TranscriptEntry {
   readonly stepIndex: number;
   /** The line's `type`, exactly as written. */
   readonly type: string;
+  /** The line's `status` (`DONE`, `RUNNING`, `ERROR`), when it has one. */
+  readonly status?: string;
+  /** Who wrote the step: `MODEL`, `SYSTEM` or `USER_EXPLICIT`. */
+  readonly source?: string;
   readonly content?: string;
   readonly toolCalls: readonly TranscriptToolCall[];
 }
@@ -89,6 +93,8 @@ export function parseTranscriptLines(text: string): ParsedTranscript {
     byStep.set(stepIndex, {
       stepIndex,
       type,
+      ...(typeof record.status === "string" ? { status: record.status } : {}),
+      ...(typeof record.source === "string" ? { source: record.source } : {}),
       ...(typeof record.content === "string" ? { content: record.content } : {}),
       toolCalls: readToolCalls(record.tool_calls),
     });

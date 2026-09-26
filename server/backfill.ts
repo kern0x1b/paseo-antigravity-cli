@@ -135,39 +135,13 @@ export function stepsPast(entries: readonly TranscriptEntry[], settledStep: numb
 }
 
 /**
- * Background tasks the conversation started since the last prompt at or before `settledStep`, and
- * those of them no notice has reported ended yet. Captured with agy 1.2.10: the call's GENERIC
- * result reads `Tool is running as a background task with task id: <conversation>/task-54`, and the
- * end arrives as a SYSTEM_MESSAGE carrying `Task id "<conversation>/task-54" finished with result:`.
- * Only `finished` was observed; the other endings are matched so a canceled task is not waited on.
+ * Whether the model has done anything in these steps: answered, or called a tool. A step agy wrote
+ * about the conversation instead — the notice of a finished or canceled task, a checkpoint, an
+ * error — does not wake the model by itself, and a run of only those is not a turn.
  */
-export function backgroundTasks(
-  entries: readonly TranscriptEntry[],
-  settledStep: number,
-): { started: number; open: Set<string> } {
-  let since = -1;
-  for (const entry of entries) {
-    if (entry.type === USER_INPUT && entry.stepIndex <= settledStep) since = Math.max(since, entry.stepIndex);
-  }
-  const sorted = entries
-    .filter((entry) => entry.stepIndex > since)
-    .sort((left, right) => left.stepIndex - right.stepIndex);
-  const open = new Set<string>();
-  let started = 0;
-  for (const entry of sorted) {
-    const content = entry.content ?? "";
-    const start = TASK_STARTED.exec(content);
-    if (entry.type === GENERIC && start?.[1]) {
-      started += 1;
-      open.add(start[1]);
-    }
-    for (const end of content.matchAll(TASK_ENDED)) if (end[1]) open.delete(end[1]);
-  }
-  return { started, open };
+export function modelActed(steps: readonly TranscriptEntry[]): boolean {
+  return steps.some((entry) => entry.type === PLANNER_RESPONSE);
 }
-
-const TASK_STARTED = /running as a background task with task id: (\S+)/;
-const TASK_ENDED = /Task id "?([^"\s]+?)"? (?:finished|completed|canceled|cancelled|failed|terminated)\b/g;
 
 /** Poll period while a stream is stuck, or while a conversation may carry on after its turn. */
 const POLL_MS = 1_000;

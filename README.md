@@ -101,17 +101,20 @@ the turn's `result` behind it — the conversation itself carries on in its own 
 transcript (`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript.jsonl`)
 and publish the steps the stream is holding.
 
-An answer like "the checks are running, I'll wait" is not the end of the turn: while a background
-command the turn started has not ended, the turn stays running. When the command ends, agy wakes the
-model, and what it does then is published into the same turn, which completes at the model's final
-answer once no command it started is still running and no subagent is either. A message you send
-meanwhile waits for that, as it would behind any running turn; stopping the agent cancels the turn.
+The turn completes at the model's answer, as it does for any other provider; a message you send
+next is served straight away. If the command is still running then, a notice says so, and the CLI
+holding it is left running so a server stays up. When a command ends (or a timer fires), agy wakes
+the model, and what it does then is published as a turn of its own — one Paseo shows as started by
+the agent rather than by you — from the model's first step to its final answer. Stopping the agent
+cancels that turn. A message you send while it runs waits for it, since the CLI cannot take another
+turn; otherwise the CLI cannot take another turn either (a line written to it would queue behind the
+command), so your next message stops it — and the command with it — and resumes the conversation in
+a fresh CLI.
 
-A command that is still running after 30 minutes — a dev server never ends — completes the turn
-anyway, and a notice says the command is still running. The CLI holding it is left running, so the
-server stays up; if the command ends later and the model carries on, that is shown as a turn of its
-own. The CLI cannot take another turn (a line written to it would queue behind the command), so
-your next message stops it — and the command with it — and resumes the conversation in a fresh CLI.
+What counts as a task is read from the fields agy structures in the transcript, not from its
+wording: a `GENERIC` step that stays `RUNNING` and names a `…/task-N` id starts one, and a
+`SYSTEM_MESSAGE` whose `[Message]` header names that id as its `sender` reports on it (finished,
+canceled, a timer firing, or output that stabilized).
 
 ## Subagents
 

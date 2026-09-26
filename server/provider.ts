@@ -22,8 +22,8 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import {
   TranscriptPoller,
-  backgroundTasks,
   conversationTranscriptPath,
+  modelActed,
   renderBackfill,
   stepsPast,
 } from "./backfill";
@@ -63,6 +63,7 @@ import {
 import { injectMcpServers, mcpConfigPath, releaseMcpServers, sweepMcpLedger } from "./mcp";
 import { pluginDataDir, unsafePathChars } from "./plugindata";
 import { listConversations } from "./sessions";
+import { openBackgroundTasks } from "./tasks";
 import {
   SubagentTranscript,
   transcriptFilePath,
@@ -83,13 +84,6 @@ const OBSERVED_LIMIT = 32;
  * moved to the background holds every later stream line until it ends (see `backfill.ts`).
  */
 const BACKFILL_DELAY_MS = 5_000;
-
-/**
- * How long a turn is kept running after its answer while a background task it started has not
- * ended. Tests and builds end, and the model carries on in the same turn when they do; a dev server
- * never does, and a turn held for it would never finish, so past this it is settled anyway.
- */
-const TASK_HOLD_MS = 30 * 60_000;
 
 const PLAN_MODE_ID = "plan";
 /** The mode an approved plan is implemented in. */
@@ -254,22 +248,20 @@ interface Session {
   interrupting: boolean;
   closing: boolean;
   /**
-   * A CLI whose stream a background task holds (see `backfill.ts`) and whose turn is followed from
-   * the conversation transcript instead: held open while a task it started runs, or settled from
-   * there, or carrying on after its turn ended. It is kept alive — the task it holds is often a
-   * test run the model is waiting for, or a dev server the answer just told the user about, and
-   * when a task ends agy carries the conversation on in this same process — but it can never take
-   * another turn: a line written to it would queue behind that task, and its stream now owes
-   * results no turn of this plugin's is waiting for. The next prompt or close disposes it, unless
-   * it is serving a turn (see `continuation`).
+   * A CLI whose stream a background task holds (see `backfill.ts`) and whose turn was settled from
+   * the conversation transcript instead. It is kept alive — the task it holds is often a test run
+   * the model is waiting for, or a dev server the answer just told the user about, and when a task
+   * ends agy carries the conversation on in this same process — but it can never take another turn:
+   * a line written to it would queue behind that task, and its stream now owes results no turn of
+   * this plugin's is waiting for. The next prompt or close disposes it, unless it is serving a turn
+   * (see `continuation`).
    */
   detached: AgyProcess | null;
   /** The transcript follow of the detached CLI, while it lives. */
   continuation: Continuation | null;
   /**
-   * Turns announced while the detached CLI was serving a turn — held, or carrying the conversation
-   * on. They are written to a fresh CLI once that turn settles: killing the CLI mid-way would lose
-   * what it was doing.
+   * Turns announced while the detached CLI was carrying the conversation on. They are written to a
+   * fresh CLI once that turn settles: killing the CLI mid-way would lose what it was doing.
    */
   deferred: PendingTurn[];
   /** The highest step a settled turn accounted for; a later step nobody prompted is a continuation. */
@@ -342,36 +334,16 @@ interface PendingTurn {
  * and writing a new answer (seen in a real conversation: 64 steps after a long test run finished).
  * The detached stream is never read, so the transcript is the only place those steps appear.
  *
- * A turn whose answer arrived while a task it started was still running is held: the steps the
- * model takes once the task ends are published into that same turn, which stays running until an
- * answer arrives with no such task open (see `TurnHold`). A run of steps nobody was waiting for —
- * after a turn settled with a task still open — is published as a turn the plugin opens itself,
- * settled at its final answer.
+ * The turn that started the task is completed at its answer, like any other, and what the model
+ * does afterwards is published as a turn the provider starts itself — an autonomous turn, with no
+ * prompt behind it — from the first step where the model acts to its final answer.
  */
 interface Continuation {
   readonly poller: TranscriptPoller;
   /** Every step up to here is already published under some turn. */
   settledStep: number;
-  /**
-   * The turn publishing the steps past `settledStep`, while one is open: the held turn itself, or
-   * one the plugin opened for steps nobody prompted.
-   */
+  /** The autonomous turn publishing the steps past `settledStep`, while one is open. */
   turn: PendingTurn | null;
-  /** Set while `turn` is a prompted turn held open behind its background tasks. */
-  hold: TurnHold | null;
-  /** What the transcript held when last read, so a hold can be judged again without a change. */
-  entries: readonly TranscriptEntry[] | null;
-}
-
-/**
- * A prompted turn kept running after its answer because a background task it started has not
- * ended. The model saying "the tests are running, I'll wait" is not the end of the turn: agy wakes
- * it when the task ends, and what it does then is what the prompt asked for.
- */
-interface TurnHold {
-  /** Runs out after `TASK_HOLD_MS`, when the turn is settled even with a task still open. */
-  readonly timer: NodeJS.Timeout;
-  expired: boolean;
 }
 
 /** The fields of a tool row, kept so a call left open can be republished with a terminal status. */
@@ -1387,12 +1359,7 @@ function applyBackfill(
   );
   publishTranscriptRows(session, emit, turn, render.rows);
   if (render.finalStep === null || !turn.backfilled.has(render.finalStep)) return;
-  // An answer given while a task this turn started still runs is the model waiting for it.
-  if (backgroundTasks(entries, render.finalStep).open.size > 0 && session.conversationId !== null) {
-    holdTurn(session, turn, emit, render.finalStep, entries);
-    return;
-  }
-  settleFromTranscript(session, turn, emit, render.finalStep);
+  settleFromTranscript(session, turn, emit, render.finalStep, entries);
 }
 
 /** Publishes the transcript's rows a turn does not have yet, and tracks them as that turn's. */
@@ -1428,20 +1395,19 @@ function publishTranscriptRows(
 }
 
 /**
- * Completes a turn whose answer only the transcript has, when no task it started is known to be
- * still running. The CLI serving it still owes that turn's `result`, and will not read another line
- * until its background task ends, so it is detached: nothing it prints is used any more, and a
- * fresh CLI resumes the conversation for the next turn.
+ * Completes a turn whose answer only the transcript has. The CLI serving it still owes that turn's
+ * `result`, and will not read another line until its background task ends, so it is detached:
+ * nothing it prints is used any more, and a fresh CLI resumes the conversation for the next turn.
  *
- * The answer is provisional: a task whose start or end is worded differently from the captured
- * notices is not seen, and once it ends the model may carry on in the detached CLI; the transcript
- * keeps being followed for that (see `Continuation`).
+ * The answer is final for this turn, as any answer is. If a task the turn started ends later and
+ * agy wakes the model, what it does then is published as a turn of its own (see `Continuation`).
  */
 function settleFromTranscript(
   session: Session,
   turn: PendingTurn,
   emit: Emit,
   finalStep: number,
+  entries: readonly TranscriptEntry[],
 ): void {
   stopBackfill(turn);
   session.settledStep = Math.max(session.settledStep, finalStep);
@@ -1457,42 +1423,10 @@ function settleFromTranscript(
   const stuck = session.process;
   session.process = null;
   if (stuck) detachProcess(session, emit, stuck);
-  emitBackgroundTaskNotice(session, emit);
+  if (openBackgroundTasks(entries, finalStep).size > 0) emitBackgroundTaskNotice(session, emit);
   // Turns written behind the settled one were queued inside the detached CLI and would never run
   // there, so they go to the fresh one instead. Their `started` was already announced.
   if (queued.length > 0) void resendQueued(session, emit, queued);
-}
-
-/**
- * Keeps a turn running after its answer, because a background task it started is still running
- * and the model will carry on in this turn when it ends. The CLI is detached exactly as for a
- * settled turn — its stream will not deliver anything until the task ends — and the turn goes on
- * being followed from the transcript by the detached CLI's continuation, which settles it (see
- * `applyContinuation`).
- */
-function holdTurn(
-  session: Session,
-  turn: PendingTurn,
-  emit: Emit,
-  finalStep: number,
-  entries: readonly TranscriptEntry[],
-): void {
-  const stuck = session.process;
-  if (!stuck) {
-    settleFromTranscript(session, turn, emit, finalStep);
-    return;
-  }
-  stopBackfill(turn);
-  const queued = session.pendingTurns.filter((pending) => pending !== turn);
-  session.pendingTurns = [];
-  session.process = null;
-  // Turns written behind the held one were queued inside the detached CLI and would never run
-  // there, so they wait for it to settle, in front of anything sent from here on.
-  session.deferred = [...queued, ...session.deferred];
-  console.log(
-    `[antigravity] holding ${turn.turnId} open: it answered while a background task it started is still running`,
-  );
-  detachProcess(session, emit, stuck, { turn, settledStep: finalStep, entries });
 }
 
 /** Tells the user that a turn completed while a command it started still runs in the background. */
@@ -1512,22 +1446,16 @@ async function resendQueued(session: Session, emit: Emit, queued: readonly Pendi
   for (const turn of queued) await writePendingTurn(session, emit, turn);
 }
 
-/** Whether the detached CLI is serving a turn: one held open, or one carrying the conversation on. */
+/** Whether the detached CLI is serving a turn: the model carrying the conversation on by itself. */
 function isContinuing(session: Session): boolean {
   return session.continuation?.turn != null;
 }
 
 /**
  * Takes a CLI off the session — its stream is no longer read — and follows the conversation it
- * holds from the transcript for as long as it lives. `held` is a turn that goes on running in it,
- * answered up to `settledStep`.
+ * holds from the transcript for as long as it lives.
  */
-function detachProcess(
-  session: Session,
-  emit: Emit,
-  process: AgyProcess,
-  held?: { turn: PendingTurn; settledStep: number; entries: readonly TranscriptEntry[] },
-): void {
+function detachProcess(session: Session, emit: Emit, process: AgyProcess): void {
   stopContinuation(session);
   if (session.detached) void session.detached.dispose();
   session.detached = process;
@@ -1537,79 +1465,39 @@ function detachProcess(
     poller: new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
       applyContinuation(session, emit, continuation, entries),
     ),
-    settledStep: held?.settledStep ?? session.settledStep,
-    turn: held?.turn ?? null,
-    hold: null,
-    entries: held?.entries ?? null,
+    settledStep: session.settledStep,
+    turn: null,
   };
-  if (held) {
-    const limit = taskHoldMs();
-    const hold: TurnHold = {
-      timer: setTimeout(() => {
-        hold.expired = true;
-        console.log(`[antigravity] a background task outlasted the ${limit / 1000}s hold of ${held.turn.turnId}`);
-        judgeHold(session, emit);
-      }, limit),
-      expired: false,
-    };
-    hold.timer.unref();
-    continuation.hold = hold;
-  }
   session.continuation = continuation;
   continuation.poller.start();
 }
 
-function taskHoldMs(): number {
-  // The tests shorten the hold; nothing else sets this.
-  return Number(process.env.PASEO_ANTIGRAVITY_TASK_HOLD_MS) || TASK_HOLD_MS;
-}
-
 /** Stops following the detached CLI's conversation. An open continuation is settled by the caller. */
 function stopContinuation(session: Session): void {
-  const continuation = session.continuation;
-  if (continuation?.hold) clearTimeout(continuation.hold.timer);
-  continuation?.poller.stop();
+  session.continuation?.poller.stop();
   session.continuation = null;
 }
 
 /**
- * Looks at a held turn again without waiting for the transcript to change: once its hold runs out,
- * and once a subagent it may be waiting for finishes.
- */
-function judgeHold(session: Session, emit: Emit): void {
-  const continuation = session.continuation;
-  if (continuation?.hold && continuation.entries) {
-    applyContinuation(session, emit, continuation, continuation.entries);
-  }
-}
-
-/** Whether a followed subagent is still running, and could still wake the conversation. */
-function isChildRunning(session: Session): boolean {
-  return [...session.follows.values()].some((follow) => !follow.done);
-}
-
-/**
- * Publishes the steps the detached CLI took since the last settled one. A held turn gets them as
- * its own, and is settled at a final answer once no task it started is still running and no
- * subagent is either — or, past its hold, at the next final answer whatever still runs, which is
- * then settled exactly as `settleFromTranscript` would have. Otherwise the first of them opens a
- * turn of the plugin's own — usually the SYSTEM_MESSAGE announcing a finished task, written the
- * same second as the model's first step after it — and the final answer settles it.
+ * Publishes the steps the detached CLI took since the last settled one, as a turn of the plugin's
+ * own. The turn opens at the first step where the model acts — the SYSTEM_MESSAGE announcing a
+ * finished task comes first, and one that does not wake the model (a canceled task, say) opens
+ * nothing — and the model's final answer completes it. Another wake-up after that opens the next.
  */
 function applyContinuation(
   session: Session,
   emit: Emit,
   continuation: Continuation,
-  entries: Parameters<typeof renderBackfill>[0],
+  entries: readonly TranscriptEntry[],
 ): void {
   if (session.closing || session.continuation !== continuation) return;
-  continuation.entries = entries;
-  const hold = continuation.hold;
-  const past = stepsPast(entries, continuation.settledStep);
-  if (past.length === 0 && hold === null) return;
+  // A prompted turn is being served by a CLI of its own: it owns the timeline until it settles.
+  if (session.pendingTurns.length > 0) return;
 
+  const past = stepsPast(entries, continuation.settledStep);
   let turn = continuation.turn;
   if (turn === null) {
+    if (!modelActed(past)) return;
     turn = createPendingTurn(session, false);
     continuation.turn = turn;
     console.log(
@@ -1626,40 +1514,17 @@ function applyContinuation(
     session.config.cwd,
   );
   publishTranscriptRows(session, emit, turn, render.rows);
-  // A held turn with nothing new past the answer it was held at is still at that answer.
-  const finalStep = past.length === 0 ? continuation.settledStep : render.finalStep;
-  if (finalStep === null || (past.length > 0 && !turn.backfilled.has(finalStep))) return;
-
-  const tasks = backgroundTasks(entries, finalStep);
-  const childRunning = isChildRunning(session);
-  const running = tasks.open.size > 0 || childRunning;
-  if (hold !== null && running && !hold.expired) return;
+  const finalStep = render.finalStep;
+  if (finalStep === null || !turn.backfilled.has(finalStep)) return;
 
   // As provisional as any answer settled from the transcript: another task may end and wake the
   // model again, which opens the next continuation from here.
-  if (hold !== null) clearTimeout(hold.timer);
-  continuation.hold = null;
   continuation.turn = null;
   continuation.settledStep = finalStep;
   session.settledStep = Math.max(session.settledStep, finalStep);
   finalizeToolCalls(session, emit, turn, { status: "completed" });
   emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
-  if (hold !== null) {
-    offerPlan(session, emit, turn, lastAssistantText(turn));
-    if (running) emitBackgroundTaskNotice(session, emit);
-  }
-
-  if (session.deferred.length > 0) {
-    void sendDeferred(session, emit);
-    return;
-  }
-  // Every task this conversation started has reported its end and no subagent is still running,
-  // so nothing is left that could wake the CLI: it is released now rather than followed until the
-  // next prompt. Tasks are only counted when some were seen, so a notice worded differently from
-  // the captured one keeps the CLI followed instead of cutting a continuation short.
-  if (tasks.started > 0 && tasks.open.size === 0 && !childRunning) {
-    void releaseDetached(session);
-  }
+  if (session.deferred.length > 0) void sendDeferred(session, emit);
 }
 
 /** Writes the turns deferred behind a continuation to a fresh CLI, in the order they were sent. */
@@ -2406,8 +2271,6 @@ function handleChildRender(
     // The child's rows are complete here, so they no longer have to wait out the write debounce:
     // a session closed right after this still replays everything the child said.
     void follow.store?.flush();
-    // A turn held open may have been waiting for nothing but this child.
-    judgeHold(session, emit);
   }
 }
 

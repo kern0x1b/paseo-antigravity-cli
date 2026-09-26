@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backgroundTasks, renderBackfill, stepsPast } from "./backfill";
+import { modelActed, renderBackfill, stepsPast } from "./backfill";
 import type { TranscriptEntry } from "./subagents";
 
 function entry(overrides: Partial<TranscriptEntry> & { stepIndex: number; type: string }): TranscriptEntry {
@@ -42,46 +42,31 @@ describe("stepsPast", () => {
   });
 });
 
-describe("backgroundTasks", () => {
-  it("tracks started background tasks and removes finished ones", () => {
-    const entries: TranscriptEntry[] = [
-      entry({ stepIndex: 0, type: "USER_INPUT", content: "run job" }),
-      entry({ stepIndex: 1, type: "GENERIC", content: "Tool is running as a background task with task id: conv/task-1" }),
-      entry({ stepIndex: 2, type: "GENERIC", content: "Tool is running as a background task with task id: conv/task-2" }),
-      entry({ stepIndex: 3, type: "SYSTEM_MESSAGE", content: 'Task id "conv/task-1" finished with result:\nOutput: ok' }),
+describe("modelActed", () => {
+  it("is false while agy has only told the model something", () => {
+    const past: TranscriptEntry[] = [
+      entry({ stepIndex: 3, type: "SYSTEM_MESSAGE", status: "DONE", content: "[Message] sender=c/task-1 priority=MESSAGE_PRIORITY_LOW" }),
     ];
-
-    const tasks = backgroundTasks(entries, 2);
-    expect(tasks.started).toBe(2);
-    expect(tasks.open.size).toBe(1);
-    expect(tasks.open.has("conv/task-2")).toBe(true);
-    expect(tasks.open.has("conv/task-1")).toBe(false);
+    expect(modelActed(past)).toBe(false);
   });
 
-  it("reports zero open tasks when all tasks finish or are canceled", () => {
-    const entries: TranscriptEntry[] = [
-      entry({ stepIndex: 0, type: "USER_INPUT", content: "run job" }),
-      entry({ stepIndex: 1, type: "GENERIC", content: "Tool is running as a background task with task id: task-a" }),
-      entry({ stepIndex: 2, type: "SYSTEM_MESSAGE", content: 'Task id "task-a" canceled' }),
+  it("is false for a checkpoint or an error that agy wrote by itself", () => {
+    const past: TranscriptEntry[] = [
+      entry({ stepIndex: 3, type: "CHECKPOINT", status: "DONE", content: "# Resuming from a compaction" }),
+      entry({ stepIndex: 4, type: "ERROR_MESSAGE", status: "DONE" }),
     ];
-
-    const tasks = backgroundTasks(entries, 1);
-    expect(tasks.started).toBe(1);
-    expect(tasks.open.size).toBe(0);
+    expect(modelActed(past)).toBe(false);
   });
 
-  it("scopes task counting to the prompt at or before settledStep", () => {
-    const entries: TranscriptEntry[] = [
-      entry({ stepIndex: 0, type: "USER_INPUT", content: "old prompt" }),
-      entry({ stepIndex: 1, type: "GENERIC", content: "Tool is running as a background task with task id: old-task" }),
-      entry({ stepIndex: 2, type: "USER_INPUT", content: "new prompt" }),
-      entry({ stepIndex: 3, type: "GENERIC", content: "Tool is running as a background task with task id: new-task" }),
-    ];
-
-    const tasks = backgroundTasks(entries, 3);
-    expect(tasks.started).toBe(1);
-    expect(tasks.open.has("new-task")).toBe(true);
-    expect(tasks.open.has("old-task")).toBe(false);
+  it("is true once the model answers or calls a tool", () => {
+    const notice = entry({ stepIndex: 3, type: "SYSTEM_MESSAGE", status: "DONE" });
+    expect(modelActed([notice, entry({ stepIndex: 4, type: "PLANNER_RESPONSE", content: "Done." })])).toBe(true);
+    expect(
+      modelActed([
+        notice,
+        entry({ stepIndex: 4, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: {} }] }),
+      ]),
+    ).toBe(true);
   });
 });
 
