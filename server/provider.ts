@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import {
   negotiateProviderCapabilities,
   requireProviderCapabilities,
@@ -559,7 +559,9 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
       emit({
         type: "sessions",
         requestId: input.requestId,
-        sessions: listConversations({ cwd: input.cwd, query: input.query, limit: input.limit }),
+        sessions: listConversations({ cwd: input.cwd, query: input.query, limit: input.limit }).filter(
+          (summary) => !runningConversations(state).has(readConversationId(summary.persistence) ?? ""),
+        ),
       });
       return;
     case "session.open":
@@ -585,12 +587,34 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
   }
 }
 
+/**
+ * Conversations that a session of this connection is running. Paseo offers listed conversations for
+ * import, and one listed while its own session is still on its first turn would be imported a second
+ * time as a new agent.
+ */
+function runningConversations(state: ConnectionState): Set<string> {
+  const ids = new Set<string>();
+  for (const session of state.sessions.values()) {
+    if (!session.closing && session.conversationId) ids.add(session.conversationId);
+  }
+  return ids;
+}
+
+function insidePluginData(cwd: string): boolean {
+  const own = resolve(pluginDataDir());
+  const path = resolve(cwd);
+  return path === own || path.startsWith(`${own}${sep}`);
+}
+
 async function openSession(
   input: Extract<ProviderInput, { type: "session.open" }>,
   state: ConnectionState,
   emit: Emit,
 ): Promise<void> {
   const config = input.config;
+  if (insidePluginData(config.cwd)) {
+    throw new Error(`${config.cwd} is where this plugin keeps its own files, not a workspace`);
+  }
   const conversationId = readConversationId(input.persistence);
   const options = readProviderOptions(config);
   const persist = config.persist !== false;

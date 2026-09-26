@@ -2016,6 +2016,40 @@ describe("session import", () => {
     expect(argv[argv.indexOf("--conversation") + 1]).toBe(IMPORTED_ID);
   });
 
+  it("does not offer a conversation that a live session is already running", async () => {
+    const home = join(tempDir, "home");
+    process.env.HOME = home;
+    writeConversationDb(home, [
+      {
+        conversationId: IMPORTED_ID,
+        title: "Replace Word In File",
+        preview: "In hello.txt change the word hello to bye.",
+        lastModifiedTime: "2026-09-23 15:45:49.636929+00:00",
+        workspacePaths: [tempDir],
+      },
+      {
+        conversationId: "11111111-2222-3333-4444-555555555555",
+        title: "The running one",
+        preview: "hello",
+        lastModifiedTime: "2026-09-23 16:00:00+00:00",
+        workspacePaths: [tempDir],
+      },
+    ]);
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const listed = await list(connection, events);
+    expect(listed.sessions.map((session) => session.persistence.data)).toEqual([{ conversationId: IMPORTED_ID }]);
+  });
+
+  it("refuses to open a session in the plugin's own attachments folder", async () => {
+    const { connection } = await connect();
+    const attachments = join(process.env.PASEO_HOME ?? "", "plugin-data", "antigravity-cli", "attachments", "x");
+    await expect(openSession(connection, { cwd: attachments })).rejects.toThrow("not a workspace");
+  });
+
   it("says nothing about replay for a conversation this plugin stored itself", async () => {
     const { connection, events } = await connect();
     await openSession(connection);
