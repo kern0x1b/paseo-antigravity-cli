@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { modelActed, renderBackfill, stepsPast } from "./backfill";
-import type { TranscriptEntry } from "./subagents";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { parseTranscriptLines, type TranscriptEntry } from "./subagents";
 
 function entry(overrides: Partial<TranscriptEntry> & { stepIndex: number; type: string }): TranscriptEntry {
   return { toolCalls: [], ...overrides };
@@ -186,6 +188,32 @@ describe("renderBackfill", () => {
         status: "failed",
         error: { message: "permission denied" },
       });
+    });
+  });
+
+  describe("on a captured transcript", () => {
+    const captured = parseTranscriptLines(
+      readFileSync(fileURLToPath(new URL("../fixtures/13-background-tasks.transcript.jsonl", import.meta.url)), "utf8"),
+    ).entries;
+
+    it("shows the command that started a task as running, and the model's answer as final", () => {
+      const rendered = render(captured.filter((item) => item.stepIndex <= 3));
+      expect(rendered.rows.find((row) => row.stepIndex === 2)?.item).toMatchObject({ type: "tool_call", status: "running" });
+      expect(rendered.finalStep).toBe(3);
+      expect(rendered.finalText).toContain("started the test suite");
+    });
+
+    it("renders the model's own check on a task, and its kill, as tool rows that finished", () => {
+      const rendered = render(captured.filter((item) => item.stepIndex >= 10 && item.stepIndex <= 16));
+      const kill = rendered.rows.find((row) => row.stepIndex === 14)?.item;
+      // A `manage_task` call has no diff or command to show, but it must not vanish or crash.
+      expect(kill).toMatchObject({ type: "tool_call", name: "manage_task" });
+      expect(rendered.finalStep).toBe(16);
+    });
+
+    it("finds the last answer through a checkpoint, an error and a notice written after it", () => {
+      const rendered = render(captured.filter((item) => item.stepIndex >= 5 && item.stepIndex <= 9));
+      expect(rendered.finalStep).toBe(7);
     });
   });
 });

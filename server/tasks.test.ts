@@ -166,4 +166,19 @@ describe("openBackgroundTasks", () => {
     const entries = captured().filter((item) => item.stepIndex <= 7);
     expect(openBackgroundTasks(entries.reverse(), 7).size).toBe(0);
   });
+
+  it("takes the notice agy sends when it restarts for a message from no task at all", () => {
+    // A resumed conversation starts with `sender=system`: every task of the process before it is
+    // gone, and none of them is this prompt's to wait for. It names no task, so it opens and closes
+    // nothing, and a task from before the new prompt is out of scope anyway.
+    const entries = captured();
+    const notice = entries.find((item) => item.stepIndex === 22);
+    expect(parseSystemMessages(notice?.content ?? "")).toEqual([
+      expect.objectContaining({ sender: "system", priority: "MESSAGE_PRIORITY_LOW" }),
+    ]);
+    expect(openBackgroundTasks(entries, 23).size).toBe(0);
+    // Even with a task left open before the new prompt.
+    const withOpenTask = [entry({ stepIndex: 0, type: "USER_INPUT", status: "DONE" }), taskStart(1, task(1)), ...entries.filter((item) => item.stepIndex >= 21)].map((item, index) => ({ ...item, stepIndex: item.stepIndex + (index > 1 ? 100 : 0) }));
+    expect(openBackgroundTasks(withOpenTask, 123).size).toBe(0);
+  });
 });

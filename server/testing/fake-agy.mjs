@@ -36,6 +36,7 @@
  *                        model cancels it before answering) | trailing (notices after the answer)
  *                        | error (the transcript ends on a model error) | error-recovers
  *   FAKE_BACKGROUND_FINAL_GATE  file `finish` waits for before the model's new final answer
+ *   FAKE_BACKGROUND_DONE_FILE   created once the `background` scenario has written its last line
  *   FAKE_PID_FILE        when set, the process id is written here, so a test can tell whether it is gone
  *   FAKE_EXIT_DELAY_MS   how long after an error result the `error` scenario lingers before exiting
  *                        (agy exits after every error result, not at once); default 0
@@ -586,7 +587,17 @@ readline.createInterface({ input }).on("line", async (line) => {
     // names the task, in its envelope.
     const notice = (priority, content) =>
       `The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-09-26T12:23:40Z sender=${taskId} priority=MESSAGE_PRIORITY_${priority} content=${content}\n</SYSTEM_MESSAGE>`;
-    const line = (stepIndex, source, type, status, extra) => ({ step_index: stepIndex, source, type, status, ...extra });
+    // A transcript line as agy writes it: a planner step always has `content`, empty when the model
+    // only called tools, and every step is stamped.
+    const line = (stepIndex, source, type, status, extra) => ({
+      step_index: stepIndex,
+      source,
+      type,
+      status,
+      created_at: "2026-09-26T12:22:40Z",
+      ...(type === "PLANNER_RESPONSE" && !("content" in extra) ? { content: "" } : {}),
+      ...extra,
+    });
     const path = join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 
     const modelError = (stepIndex, attempt) =>
@@ -665,6 +676,11 @@ readline.createInterface({ input }).on("line", async (line) => {
     send(stepEvent(first + 3, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "curl -s localhost:4719/health" }, output: "ok" } }));
     send(stepEvent(first + 4, "DONE", "agent_response", { text_delta: `The server is running (${text}).` }));
     sendResult(turnResult(turns, `The server is running (${text}).`));
+    // Everything the process owed has been written to the pipe: what a test waits for to know that
+    // whatever it sees next, or does not, is not still on its way.
+    if (process.env.FAKE_BACKGROUND_DONE_FILE) {
+      process.stdout.write("", () => writeFileSync(process.env.FAKE_BACKGROUND_DONE_FILE, ""));
+    }
     return;
   }
 

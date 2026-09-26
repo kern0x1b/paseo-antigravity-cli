@@ -156,6 +156,7 @@ afterEach(async () => {
     "FAKE_BACKGROUND_GATE",
     "FAKE_BACKGROUND_END",
     "FAKE_BACKGROUND_FINAL_GATE",
+    "FAKE_BACKGROUND_DONE_FILE",
   ]) {
     delete process.env[key];
   }
@@ -3241,6 +3242,7 @@ describe("background commands", () => {
     timing = { backfillDelayMs: 50, transcriptPollMs: 20, failureQuietMs: 300 };
     process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
     process.env.FAKE_BACKGROUND_FINAL_GATE = join(tempDir, "background-final-gate");
+    process.env.FAKE_BACKGROUND_DONE_FILE = join(tempDir, "background-done");
     const home = join(tempDir, "home");
     mkdirSync(home, { recursive: true });
     process.env.HOME = home;
@@ -3279,9 +3281,11 @@ describe("background commands", () => {
     const settled = paseoView(events).messages;
     const count = events.length;
     writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
-    // A real delay: what is asserted is that the detached CLI's late output produces *no* event,
-    // and there is no signal to await for something that must not happen.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The CLI says when it has written its last line; a turn of the event loop after that, the
+    // plugin has read it, so what is asserted next is not still in flight.
+    await waitFor(() => (existsSync(process.env.FAKE_BACKGROUND_DONE_FILE ?? "") ? true : undefined), "the CLI to finish");
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
     expect(events.slice(count).filter((event) => event.type !== "session.notice")).toEqual([]);
     expect(paseoView(events).messages).toEqual(settled);
   });
@@ -3427,6 +3431,103 @@ describe("background commands", () => {
     // What the model did is shown, and the prompt waits for it rather than cutting it short.
     expect(shellCall(events, "git push")).toBeDefined();
     expect(turns(events, "started")).toHaveLength(2);
+  });
+
+  describe("while the model carries on after a task", () => {
+    /** A prompted turn that settled behind a task, and a wake-up the model is now acting on. */
+    async function carryingOn(): Promise<Harness> {
+      backgroundTurn("finish");
+      process.env.FAKE_PID_FILE = join(tempDir, "agy.pid");
+      const harness = await connect();
+      await openSession(harness.connection);
+      await prompt(harness.connection, "check it");
+      await waitFor(() => turns(harness.events, "completed")[0], "the prompted turn to complete");
+      writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+      await waitFor(() => shellCall(harness.events, "git push"), "the step the model carried on with");
+      return harness;
+    }
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    it("fails that turn, and runs what was waiting, when its CLI dies", async () => {
+      const { connection, events } = await carryingOn();
+      process.env.FAKE_SCENARIO = "text";
+      await prompt(connection, "next", "m2");
+
+      process.kill(Number(readFileSync(join(tempDir, "agy.pid"), "utf8")), "SIGKILL");
+      const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+      const [, autonomous] = turnIds(events, "started");
+      expect(failed).toMatchObject({ turnId: autonomous, error: { code: "agy_exit" } });
+
+      // The prompt that was waiting is written to a fresh CLI and answered.
+      await waitFor(() => turns(events, "completed")[1], "the waiting prompt to complete");
+      expect(turnIds(events, "started")).toHaveLength(3);
+      expect(turnIds(events, "completed")[1]).toBe(turnIds(events, "started")[2]);
+    });
+
+    it("stops the CLI and publishes nothing more once the session is closed", async () => {
+      const { connection, events } = await carryingOn();
+      const pid = Number(readFileSync(join(tempDir, "agy.pid"), "utf8"));
+
+      await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+      await waitFor(() => (alive(pid) ? undefined : true), "the CLI to be gone");
+      const count = events.length;
+      writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(events.slice(count)).toEqual([]);
+      expect(events.at(-2)).toMatchObject({ type: "session.closed" });
+    });
+
+    it("runs several prompts sent meanwhile in the order they were sent", async () => {
+      const { connection, events } = await carryingOn();
+      process.env.FAKE_SCENARIO = "text";
+      await prompt(connection, "first", "m2");
+      await prompt(connection, "second", "m3");
+      expect(turns(events, "started")).toHaveLength(2);
+
+      writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+      await waitFor(() => turns(events, "completed")[3], "both queued turns to complete");
+      expect(readPrompts()).toEqual([expect.stringContaining("check it"), "first", "second"]);
+      expect(turnIds(events, "completed")).toEqual(turnIds(events, "started"));
+    });
+
+    it("refuses a structured-output prompt, which cannot share the CLI that is still answering", async () => {
+      const { connection, events } = await carryingOn();
+      await promptContent(connection, [{ type: "text", text: "as json" }], "m2", { type: "object" });
+      expect(
+        events.find((event) => event.type === "session.prompt_result" && event.clientMessageId === "m2"),
+      ).toMatchObject({ result: { type: "failed", error: { code: "busy" } } });
+    });
+  });
+
+  it("follows two sessions in one workspace independently", async () => {
+    backgroundTurn("finish");
+    const { connection, events } = await connect();
+    for (const [sessionId, conversation] of [
+      ["a", "aaaaaaaa-0000-4000-8000-00000000000a"],
+      ["b", "bbbbbbbb-0000-4000-8000-00000000000b"],
+    ] as const) {
+      await openSession(connection, { env: { FAKE_CONVERSATION_ID: conversation } }, { sessionId });
+      await prompt(connection, `check ${sessionId}`, `m-${sessionId}`, sessionId);
+    }
+    await waitFor(() => (turns(events, "completed", "a")[0] && turns(events, "completed", "b")[0]) || undefined, "both prompted turns");
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+    await waitFor(() => (turns(events, "completed", "a")[1] && turns(events, "completed", "b")[1]) || undefined, "both autonomous turns");
+
+    for (const sessionId of ["a", "b"]) {
+      const own = events.filter((event) => event.type === "timeline.item" && event.sessionId === sessionId).map((event) => (event.type === "timeline.item" ? event.item : null));
+      const answers = own.flatMap((item) => (item?.type === "assistant_message" ? [item.text] : []));
+      expect(answers).toContain(`The checks passed and the branch is pushed (check ${sessionId}).`);
+      expect(answers.some((text) => text.includes(`check ${sessionId === "a" ? "b" : "a"}`))).toBe(false);
+    }
   });
 
   it("says nothing about a task the model has already canceled", async () => {
