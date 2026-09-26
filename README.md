@@ -44,9 +44,14 @@ The first one that resolves, in this order:
 
 1. `providerOptions.agyPath` — a per-session absolute path to the binary.
 2. `PASEO_ANTIGRAVITY_BIN` — an environment variable for the daemon's environment.
-3. `~/.local/bin/agy` — checked explicitly because a daemon started by a GUI app often does not
-   inherit that directory on `PATH`.
+3. `~/.local/bin/agy`, `/opt/homebrew/bin/agy`, then `/usr/local/bin/agy` — checked explicitly
+   because a daemon started by a GUI app often does not inherit those directories on `PATH`.
 4. `agy` — resolved from `PATH`.
+
+The CLI is started in a process group of its own. Closing a session, restarting for a changed
+setting, or shutting the plugin down asks it to stop (SIGTERM to the group), so it can flush the
+conversation it was writing, and kills the group after a few seconds if it has not gone. What the
+CLI started goes with it, but a plugin process that is itself killed cannot clean up after it.
 
 ## What the plugin supports
 

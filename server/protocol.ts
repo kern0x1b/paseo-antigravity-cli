@@ -9,45 +9,51 @@ import { z } from "zod";
  *   step_update  -> { step_update: { step_index, state, step_type, ... } }
  *   result       -> { result: { status, response, error?, num_turns, usage } } (one per turn)
  *
- * Everything is marked optional and unknown kinds are dropped rather than thrown, because
- * agy ships updates frequently and a schema drift must not take the provider down.
+ * Only what an event cannot do without is required — the step's index, state and type, the result's
+ * status. Every other field is decoded leniently: one that is missing or has an unusable value
+ * becomes `undefined` instead of failing the line, because a schema drift in `usage` must not cost
+ * the `result` that ends the turn. Unknown kinds are dropped, and a known kind that still cannot be
+ * decoded is reported as `malformed` so the caller can log it and, for a `result`, fail the turn.
  */
 
+/** An optional field that reads as absent when its value is unusable. */
+const lenient = <T extends z.ZodType>(schema: T) => schema.optional().catch(undefined);
+
 const usageSchema = z.object({
-  input_tokens: z.number().optional(),
-  output_tokens: z.number().optional(),
-  thinking_tokens: z.number().optional(),
-  cache_read_tokens: z.number().optional(),
-  total_tokens: z.number().optional(),
+  input_tokens: lenient(z.number()),
+  output_tokens: lenient(z.number()),
+  thinking_tokens: lenient(z.number()),
+  cache_read_tokens: lenient(z.number()),
+  total_tokens: lenient(z.number()),
 });
 
 const initSchema = z.object({
   // An empty id shows up on an eligibility failure and would name a transcript file ".jsonl".
   conversation_id: z.string().min(1),
-  init: z
-    .object({
-      cwd: z.string().optional(),
-      tools: z.array(z.string()).optional(),
-      permission_mode: z.string().optional(),
-    })
-    .optional(),
+  init: lenient(
+    z.object({
+      cwd: lenient(z.string()),
+      tools: lenient(z.array(z.string())),
+      permission_mode: lenient(z.string()),
+    }),
+  ),
 });
 
 const toolInfoSchema = z.object({
-  name: z.string().optional(),
-  parameters: z.record(z.string(), z.unknown()).optional(),
-  output: z.string().optional(),
+  name: lenient(z.string()),
+  parameters: lenient(z.record(z.string(), z.unknown())),
+  output: lenient(z.string()),
 });
 
 /** One child an `invoke_subagent` step spawned, as the subagent line reports it. */
 const subagentSchema = z.looseObject({
-  type_name: z.string().optional(),
-  role: z.string().optional(),
-  initial_prompt: z.string().optional(),
-  conversation_id: z.string().optional(),
+  type_name: lenient(z.string()),
+  role: lenient(z.string()),
+  initial_prompt: lenient(z.string()),
+  conversation_id: lenient(z.string()),
   /** `file:` URL of the child's own transcript, which is how a child can be followed. */
-  log_uri: z.string().optional(),
-  workspace_uris: z.array(z.string()).optional(),
+  log_uri: lenient(z.string()),
+  workspace_uris: lenient(z.array(z.string())),
 });
 
 /**
@@ -61,27 +67,27 @@ const subagentInfoSchema = z
   .catch(undefined);
 
 const stepUpdateSchema = z.object({
-  conversation_id: z.string().optional(),
+  conversation_id: lenient(z.string()),
   step_index: z.number(),
   state: z.string(),
   step_type: z.string(),
   /** Incremental text chunk, not a snapshot. Absent on non-text steps. */
-  text_delta: z.string().optional(),
-  tool_name: z.string().optional(),
-  tool_info: toolInfoSchema.optional(),
-  subagent_info: subagentInfoSchema.optional(),
-  duration_seconds: z.number().optional(),
-  usage: usageSchema.optional(),
+  text_delta: lenient(z.string()),
+  tool_name: lenient(z.string()),
+  tool_info: lenient(toolInfoSchema),
+  subagent_info: subagentInfoSchema,
+  duration_seconds: lenient(z.number()),
+  usage: lenient(usageSchema),
 });
 
 const resultSchema = z.object({
-  conversation_id: z.string().optional(),
+  conversation_id: lenient(z.string()),
   status: z.string(),
-  response: z.string().optional(),
-  error: z.string().optional(),
-  duration_seconds: z.number().optional(),
-  num_turns: z.number().optional(),
-  usage: usageSchema.optional(),
+  response: lenient(z.string()),
+  error: lenient(z.string()),
+  duration_seconds: lenient(z.number()),
+  num_turns: lenient(z.number()),
+  usage: lenient(usageSchema),
   /**
    * Present only when the process was launched with `--json-schema`: the model's answer decoded
    * against that schema. `response` then repeats the same JSON with extra `toolAction` /
@@ -100,7 +106,10 @@ export type AgyEvent =
   | { kind: "init"; conversationId: string; cwd?: string; tools: readonly string[] }
   | { kind: "step_update"; step: AgyStepUpdate }
   | { kind: "result"; result: AgyResult }
-  | { kind: "unknown"; event: string };
+  /** A kind this plugin does not know. */
+  | { kind: "unknown"; event: string }
+  /** A kind it knows, whose payload cannot be decoded. */
+  | { kind: "malformed"; event: string; reason: string };
 
 /** Values seen for `step_update.step_type`. Treated as data, never as a closed enum. */
 export const STEP_USER_INPUT = "user_input";
@@ -189,7 +198,7 @@ export function parseAgyLine(raw: string): AgyEvent | null {
 
   if (name === "init") {
     const parsed = initSchema.safeParse(envelope);
-    if (!parsed.success) return { kind: "unknown", event: name };
+    if (!parsed.success) return malformed(name, parsed.error);
     return {
       kind: "init",
       conversationId: parsed.data.conversation_id,
@@ -200,17 +209,23 @@ export function parseAgyLine(raw: string): AgyEvent | null {
 
   if (name === "step_update") {
     const parsed = stepUpdateSchema.safeParse(envelope.step_update);
-    if (!parsed.success) return { kind: "unknown", event: name };
+    if (!parsed.success) return malformed(name, parsed.error);
     return { kind: "step_update", step: parsed.data };
   }
 
   if (name === "result") {
     const parsed = resultSchema.safeParse(envelope.result);
-    if (!parsed.success) return { kind: "unknown", event: name };
+    if (!parsed.success) return malformed(name, parsed.error);
     return { kind: "result", result: parsed.data };
   }
 
   return { kind: "unknown", event: name };
+}
+
+function malformed(event: string, error: z.ZodError): AgyEvent {
+  const issue = error.issues[0];
+  const where = issue && issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
+  return { kind: "malformed", event, reason: `${where}${issue?.message ?? "unusable payload"}` };
 }
 
 /** One user turn, as written to agy stdin. */

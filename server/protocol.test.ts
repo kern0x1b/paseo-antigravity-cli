@@ -45,28 +45,77 @@ describe("parseAgyLine", () => {
     expect(parseAgyLine('{"no_event_field":true}')).toBeNull();
   });
 
-  it("degrades to an unknown event instead of throwing on a payload it cannot decode", () => {
+  it("degrades to an unknown event instead of throwing on a name it does not know", () => {
     expect(parseAgyLine('{"event":"something_new"}')).toEqual({
       kind: "unknown",
       event: "something_new",
     });
-    // A known name with an unusable payload must not surface as a typed event.
+  });
+
+  it("reports a known event whose payload is unusable as malformed, with the reason", () => {
     expect(parseAgyLine('{"event":"result","result":{"nope":true}}')).toEqual({
-      kind: "unknown",
+      kind: "malformed",
       event: "result",
+      reason: expect.stringContaining("status"),
     });
     expect(parseAgyLine('{"event":"step_update"}')).toEqual({
-      kind: "unknown",
+      kind: "malformed",
       event: "step_update",
+      reason: expect.any(String),
+    });
+    // An eligibility failure reports an empty id, which would name a transcript file ".jsonl".
+    expect(parseAgyLine('{"event":"init","conversation_id":"","init":{"cwd":"/tmp"}}')).toEqual({
+      kind: "malformed",
+      event: "init",
+      reason: expect.any(String),
     });
   });
 
-  it("rejects an init event without a usable conversation id", () => {
-    // An eligibility failure reports an empty id, which would name a transcript file ".jsonl".
-    expect(parseAgyLine('{"event":"init","conversation_id":"","init":{"cwd":"/tmp"}}')).toEqual({
-      kind: "unknown",
-      event: "init",
+  it("keeps a result whose optional fields are unusable, because it ends the turn", () => {
+    const event = parseAgyLine(
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "done",
+          num_turns: "two",
+          duration_seconds: null,
+          usage: { input_tokens: null, output_tokens: 27 },
+        },
+      }),
+    );
+    expect(event).toMatchObject({ kind: "result", result: { status: "SUCCESS", response: "done" } });
+  });
+
+  it("needs nothing but a status to decode a result", () => {
+    expect(parseAgyLine('{"event":"result","result":{"status":"ERROR"}}')).toMatchObject({
+      kind: "result",
+      result: { status: "ERROR" },
     });
+  });
+
+  it("keeps a step whose usage or tool info is unusable", () => {
+    const event = parseAgyLine(
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          step_index: 3,
+          state: "DONE",
+          step_type: "tool",
+          usage: { input_tokens: null },
+          tool_name: "run_command",
+          tool_info: { name: "run_command", parameters: ["not", "a", "record"] },
+          text_delta: 7,
+        },
+      }),
+    );
+    expect(event).toMatchObject({
+      kind: "step_update",
+      step: { step_index: 3, state: "DONE", step_type: "tool", tool_name: "run_command" },
+    });
+    const step = event?.kind === "step_update" ? event.step : null;
+    expect(step?.usage?.input_tokens).toBeUndefined();
+    expect(step?.text_delta).toBeUndefined();
   });
 
   it("decodes init with its conversation id and tool list", () => {

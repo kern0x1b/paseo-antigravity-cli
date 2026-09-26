@@ -128,6 +128,10 @@ afterEach(async () => {
     "FAKE_SCENARIO",
     "FAKE_MODELS_OK",
     "FAKE_CONVERSATION_ID",
+    "FAKE_PID_FILE",
+    "FAKE_EXIT_DELAY_MS",
+    "FAKE_INTERRUPT_ERROR",
+    "FAKE_CHILD_PID_FILE",
     "FAKE_STDERR_LINE",
     "FAKE_RESULT_ERROR",
     "FAKE_TOOL_END",
@@ -3191,6 +3195,57 @@ describe("background commands", () => {
     expect(launches[1]).toContain("--conversation");
   });
 
+  it("announces a prompt sent while the model carries on only once it is written", async () => {
+    backgroundTurn("finish");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "check it");
+    await waitFor(() => turns(events, "completed")[0], "the prompted turn to complete");
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    await waitFor(() => shellCall(events, "git push"), "the step the model carried on with");
+
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "next", "m2");
+    // The prompt is accepted, but its turn has not started: the conversation is still busy.
+    expect(events.some((event) => event.type === "session.prompt_result" && event.clientMessageId === "m2")).toBe(true);
+    expect(turns(events, "started")).toHaveLength(2);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_FINAL_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[2], "the queued turn to complete");
+    expect(turns(events, "started")).toHaveLength(3);
+  });
+
+  it("publishes a wake-up the poll has not reached yet before the CLI is replaced", async () => {
+    backgroundTurn("finish");
+    // No poll will come around in this test: only the last read before the CLI is replaced can
+    // find what the model did after the task ended.
+    timing = { backfillDelayMs: 150, transcriptPollMs: 60_000, failureQuietMs: 300 };
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "check it");
+    await waitFor(() => turns(events, "completed")[0], "the prompted turn to complete");
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    const transcript = join(
+      tempDir,
+      "home",
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "11111111-2222-3333-4444-555555555555",
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    await waitFor(() => (readFileSync(transcript, "utf8").includes("git push") ? true : undefined), "the wake-up to be written");
+
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "next", "m2");
+    // What the model did is shown, and the prompt waits for it rather than cutting it short.
+    expect(shellCall(events, "git push")).toBeDefined();
+    expect(turns(events, "started")).toHaveLength(2);
+  });
+
   it("says nothing about a task the model has already canceled", async () => {
     backgroundTurn("canceled");
     const { connection, events } = await connect();
@@ -3348,5 +3403,205 @@ describe("plan mode", () => {
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
     expect(permissions(events)).toEqual([]);
     expect(readPrompts()[0]).toBe("add a cache");
+  });
+});
+
+describe("when things go wrong", () => {
+  const pidFile = () => join(tempDir, "agy.pid");
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const agyPid = (): number => Number(readFileSync(pidFile(), "utf8"));
+  const closed = (events: ProviderEvent[], sessionId = "session-1") =>
+    events.find((event) => event.type === "session.closed" && event.sessionId === sessionId);
+
+  it("completes a turn whose result has a field of the wrong type in its usage", async () => {
+    process.env.FAKE_SCENARIO = "usage-null";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    expect(turns(events, "failed")).toEqual([]);
+  });
+
+  it("fails a turn whose result cannot be decoded, instead of leaving it running", async () => {
+    process.env.FAKE_SCENARIO = "bad-result";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+    expect(failed).toMatchObject({ error: { code: "agy_protocol", message: expect.stringContaining("result") } });
+
+    // The CLI that sent it is not trusted with another turn.
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[0], "the next turn to complete");
+    expect(readArgvLog()).toHaveLength(2);
+  });
+
+  it("fails the turn, and lets the next one run, when the host refuses an event it published", async () => {
+    let reject = true;
+    const { connection, events } = await connect();
+    connection.onEvent((event) => {
+      // What the daemon does with an event that fails its schema: it throws inside `onEvent`.
+      if (reject && event.type === "timeline.item" && event.item.type === "assistant_message") {
+        throw new Error("host rejected the event");
+      }
+    });
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+    expect(failed).toMatchObject({
+      error: { code: "internal_error", message: expect.stringContaining("host rejected the event") },
+    });
+
+    reject = false;
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[0], "the next turn to complete");
+  });
+
+  it("does not keep a session whose open failed", async () => {
+    let reject = true;
+    const { connection, events } = await connect();
+    connection.onEvent((event) => {
+      if (reject && event.type === "session.commands") throw new Error("host rejected the commands");
+    });
+    await expect(openSession(connection)).rejects.toThrow("host rejected the commands");
+
+    // The same id opens again: the failed one is not left in the connection.
+    reject = false;
+    await openSession(connection);
+    expect(events.filter((event) => event.type === "session.ready")).toHaveLength(1);
+  });
+
+  it("closes a session and stops its CLI even when releasing its MCP entries fails", async () => {
+    process.env.FAKE_SCENARIO = "interrupt";
+    process.env.FAKE_PID_FILE = pidFile();
+    const servers: ProviderSessionConfig["mcpServers"] = { paseo: { type: "stdio", command: "paseo-mcp", args: [], env: {} } };
+    const { connection, events } = await connect();
+    await openSession(connection, { mcpServers: servers, settings: { shareMcp: true } });
+    await prompt(connection, "hello");
+    await waitFor(() => events.find((event) => event.type === "session.persistence"), "the CLI to start");
+    const pid = agyPid();
+    // A directory nobody may write to: removing the entries the plugin added cannot succeed.
+    chmodSync(join(tempDir, ".agents"), 0o500);
+
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    expect(closed(events)).toBeDefined();
+    expect(events.some((event) => event.type === "request.completed" && event.requestId === "close-1")).toBe(true);
+    await waitFor(() => (alive(pid) ? undefined : true), "the CLI to be gone");
+    chmodSync(join(tempDir, ".agents"), 0o700);
+  });
+
+  it("stops every CLI when the connection closes, even if releasing an MCP entry fails", async () => {
+    process.env.FAKE_SCENARIO = "interrupt";
+    process.env.FAKE_PID_FILE = pidFile();
+    const servers: ProviderSessionConfig["mcpServers"] = { paseo: { type: "stdio", command: "paseo-mcp", args: [], env: {} } };
+    const { connection, events } = await connect();
+    await openSession(connection, { mcpServers: servers, settings: { shareMcp: true } });
+    await prompt(connection, "hello");
+    await waitFor(() => events.find((event) => event.type === "session.persistence"), "the CLI to start");
+    const pid = agyPid();
+    // A directory nobody may write to: removing the entries the plugin added cannot succeed.
+    chmodSync(join(tempDir, ".agents"), 0o500);
+
+    await connection.close();
+    await waitFor(() => (alive(pid) ? undefined : true), "the CLI to be gone");
+    chmodSync(join(tempDir, ".agents"), 0o700);
+  });
+
+  it("does not hand a new turn to a CLI that is about to exit after an error", async () => {
+    process.env.FAKE_SCENARIO = "error";
+    process.env.FAKE_EXIT_DELAY_MS = "600";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "failed")[0], "the first turn to fail");
+
+    // agy is still up for a moment, and has already said it is done with this conversation.
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "retry", "m2");
+    await waitFor(() => turns(events, "completed")[0], "the retry to complete");
+    expect(turns(events, "failed")).toHaveLength(1);
+    expect(readArgvLog()).toHaveLength(2);
+  });
+
+  it("reads an interrupt the CLI reports in other words as a cancellation", async () => {
+    process.env.FAKE_SCENARIO = "interrupt";
+    process.env.FAKE_INTERRUPT_ERROR = "Interrupted by user";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "count forever");
+    await waitFor(() => events.find((event) => event.type === "session.persistence"), "the CLI to start");
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
+    await waitFor(() => turns(events, "canceled")[0], "the turn to be canceled");
+    expect(turns(events, "failed")).toEqual([]);
+  });
+
+  it("sends the system prompt again when the turn that carried it failed before answering", async () => {
+    process.env.FAKE_SCENARIO = "fail";
+    const { connection, events } = await connect();
+    await openSession(connection, { systemPrompt: "Answer briefly." });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "failed")[0], "the first turn to fail");
+
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[0], "the second turn to complete");
+    expect(readPrompts().at(-1)).toContain("<system_instructions>\nAnswer briefly.");
+  });
+
+  it("does not start a turn the user stopped while the prompt was still being prepared", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await Promise.all([
+      prompt(connection, "never mind"),
+      connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" }),
+    ]);
+    expect(turns(events, "started")).toEqual([]);
+    expect(readArgvLog()).toEqual([]);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "session.prompt_result" &&
+          event.result.type === "failed" &&
+          event.result.error.code === "interrupted",
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses the second of two prompts sent together that cannot share a CLI", async () => {
+    process.env.FAKE_SCENARIO = "schema";
+    process.env.FAKE_SCHEMA_GATE = join(tempDir, "schema-gate");
+    const schema = { type: "object", properties: { color: { type: "string" } } };
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await Promise.all([
+      promptContent(connection, [{ type: "text", text: "one" }], "m1", schema),
+      promptContent(connection, [{ type: "text", text: "two" }], "m2", schema),
+    ]);
+    const refused = events.filter(
+      (event) => event.type === "session.prompt_result" && event.result.type === "failed",
+    );
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ clientMessageId: "m2", result: { error: { code: "busy" } } });
+    writeFileSync(process.env.FAKE_SCHEMA_GATE, "");
+    await waitFor(() => turns(events, "completed")[0], "the first turn to complete");
+  });
+
+  it("does not call an error that merely mentions 503 an outage", async () => {
+    process.env.FAKE_SCENARIO = "error";
+    process.env.FAKE_RESULT_ERROR = "the tool timed out after 503 ms";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const failed = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+    expect(failed).toMatchObject({ error: { code: "ERROR" } });
+    expect(events.some((event) => event.type === "session.notice" && event.notice.id === "agy-unavailable")).toBe(false);
   });
 });

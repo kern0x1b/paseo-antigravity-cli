@@ -97,7 +97,7 @@ const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
  * (fixtures/05-unavailable.ndjson). The check is deliberately narrow: widening it would label a
  * permanent failure such as `model does-not-exist is not recognized` as worth retrying.
  */
-const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
+const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\(code 503\)/;
 
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
@@ -243,6 +243,10 @@ interface Session {
   /** Structured `AGY_ERROR` line of the current process, if it printed one. */
   agyError: AgyErrorReport | null;
   interrupting: boolean;
+  /** Counts the interrupts received, so a prompt can tell that it was stopped while it was prepared. */
+  interruptEpoch: number;
+  /** Prompts are prepared one at a time, in the order they arrived. */
+  promptChain: Promise<void>;
   closing: boolean;
   /**
    * A CLI whose stream a background task holds (see `backfill.ts`) and whose turn was settled from
@@ -327,6 +331,10 @@ interface PendingTurn {
   outgoing: string;
   /** Sent in plan mode, so its answer is offered as a plan to implement. */
   plan: boolean;
+  /** Whether the host has been told the turn started: a turn waiting for its CLI has not been. */
+  announced: boolean;
+  /** Whether `outgoing` carries the system prompt, which goes again if the turn never got an answer. */
+  carriesSystemPrompt: boolean;
 }
 
 /**
@@ -475,33 +483,38 @@ function createConnection(capabilities: readonly ProviderCapability[], timing: T
       if (closed) return;
       closed = true;
       const running: AgyProcess[] = [];
-      const flushing: Promise<void>[] = [];
-      const releasing: Promise<void>[] = [];
+      const flushing: Array<() => Promise<void>> = [];
+      const sessionIds: string[] = [];
       for (const session of state.sessions.values()) {
         session.closing = true;
+        sessionIds.push(session.sessionId);
         if (session.process) running.push(session.process);
         if (session.detached) running.push(session.detached);
         session.process = null;
         session.detached = null;
         stopContinuation(session);
         for (const turn of session.pendingTurns) stopBackfill(turn);
-        if (session.transcript) flushing.push(session.transcript.flush());
+        const transcript = session.transcript;
+        if (transcript) flushing.push(() => transcript.flush());
         // A child is followed by a watcher and a timer of its own, and its rows live in a store of
         // its own: both end with the connection that started them.
         for (const follow of session.follows.values()) {
           follow.transcript.stop();
-          if (follow.store) flushing.push(follow.store.flush());
+          const store = follow.store;
+          if (store) flushing.push(() => store.flush());
         }
         session.follows.clear();
-        // A close without a session.close: entries this connection injected still belong to it.
-        releasing.push(releaseMcpServers(session.sessionId));
       }
       state.sessions.clear();
       listeners.clear();
       // The rows of the last turn are still inside the debounce window, so flushing before the
-      // processes are disposed is what lets a reload replay the answer that just finished.
-      await Promise.all([...flushing, ...releasing]);
-      await Promise.all(running.map((process) => process.dispose()));
+      // processes are disposed is what lets a reload replay the answer that just finished. Every
+      // step runs whatever becomes of the others: a CLI must not outlive the connection because
+      // something before it failed.
+      await Promise.allSettled(flushing.map((flush) => flush()));
+      await Promise.allSettled(running.map((process) => process.dispose()));
+      // A close without a session.close: entries this connection injected still belong to it.
+      await Promise.allSettled(sessionIds.map((id) => releaseMcpServers(id)));
     },
   };
 }
@@ -643,6 +656,8 @@ async function openSession(
     stderrTail: [],
     agyError: null,
     interrupting: false,
+    interruptEpoch: 0,
+    promptChain: Promise.resolve(),
     closing: false,
     detached: null,
     continuation: null,
@@ -653,86 +668,113 @@ async function openSession(
   };
   state.sessions.set(input.sessionId, session);
 
-  emit({
-    type: "session.opened",
-    requestId: input.requestId,
-    sessionId: input.sessionId,
-    capabilities: state.capabilities,
-    restoration: "core",
-    persistence: persistenceFor(conversationId),
-    title: config.title,
-    cwd: config.cwd,
-  });
-  emit({ type: "session.config", sessionId: input.sessionId, config: configState(session) });
-  // The composer's command picker is filled from this event, and only what arrives before
-  // `session.ready` reaches it — including for the throwaway probe a draft opens. Which of these
-  // names this plugin expands itself is kept: a later prompt re-reads the roots, and this is what
-  // separates a skill that has since disappeared from a name the CLI expands on its own.
-  const discovered = await discoverCommands(config.cwd);
-  session.publishedSkills = new Set(discovered.expanded.keys());
-  emit({
-    type: "session.commands",
-    sessionId: input.sessionId,
-    commands: [...discovered.commands],
-  });
+  try {
+    emit({
+      type: "session.opened",
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      capabilities: state.capabilities,
+      restoration: "core",
+      persistence: persistenceFor(conversationId),
+      title: config.title,
+      cwd: config.cwd,
+    });
+    emit({ type: "session.config", sessionId: input.sessionId, config: configState(session) });
+    // The composer's command picker is filled from this event, and only what arrives before
+    // `session.ready` reaches it — including for the throwaway probe a draft opens. Which of these
+    // names this plugin expands itself is kept: a later prompt re-reads the roots, and this is what
+    // separates a skill that has since disappeared from a name the CLI expands on its own.
+    const discovered = await discoverCommands(config.cwd);
+    session.publishedSkills = new Set(discovered.expanded.keys());
+    emit({
+      type: "session.commands",
+      sessionId: input.sessionId,
+      commands: [...discovered.commands],
+    });
 
-  await syncSessionMcp(session, emit);
-  // Leftovers from a process that died without releasing its entries: the ledger is the only
-  // record of them, and this is where the set of live sessions is known.
-  await sweepMcpLedger(new Set(state.sessions.keys()));
-  if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
-    emitNotice(
-      session,
-      emit,
-      "mcp-unsupported",
-      "warning",
-      "MCP servers are not applied",
-      `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.`,
-    );
-  }
-  if (addDirs.dropped.length > 0) {
-    emitNotice(
-      session,
-      emit,
-      "add-dirs-dropped",
-      "warning",
-      "Some extra directories were ignored",
-      `providerOptions.addDirs only accepts absolute paths to existing directories. Not passed to Antigravity: ${addDirs.dropped.join(", ")}.`,
-    );
-  }
-  if (conversationId !== null && !knownHistory) {
-    // A conversation resumed from Antigravity's own store was never written by this plugin, so
-    // there is nothing to replay. The history is not lost: the CLI still holds it.
-    emitNotice(
-      session,
-      emit,
-      "history-unavailable",
-      "info",
-      "Earlier history is not shown",
-      "This conversation already existed in Antigravity, so its earlier turns are not part of Paseo's timeline and are not replayed. Antigravity still has them, and the next reply continues the conversation.",
-    );
-  }
-  if (config.systemPrompt && config.systemPrompt.trim().length > 0) {
-    emitNotice(
-      session,
-      emit,
-      "system-prompt-preamble",
-      "info",
-      "System prompt sent as a preamble",
-      "Antigravity has no system-prompt flag, so it is prepended to the first message of the conversation.",
-    );
-  }
-
-  if (input.history === "replay" && session.transcript) {
-    // A child's rows are replayed with the row that spawned it, before the parent announces
-    // itself ready: a child session that arrived afterwards would be attached to a row the
-    // client had already drawn.
-    for (const item of session.transcript.list()) {
-      await replayItem(session, emit, item);
+    await syncSessionMcp(session, emit);
+    // Leftovers from a process that died without releasing its entries: the ledger is the only
+    // record of them, and this is where the set of live sessions is known.
+    await sweepMcpLedger(new Set(state.sessions.keys()));
+    if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
+      emitNotice(
+        session,
+        emit,
+        "mcp-unsupported",
+        "warning",
+        "MCP servers are not applied",
+        `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.`,
+      );
     }
-  }
+    if (addDirs.dropped.length > 0) {
+      emitNotice(
+        session,
+        emit,
+        "add-dirs-dropped",
+        "warning",
+        "Some extra directories were ignored",
+        `providerOptions.addDirs only accepts absolute paths to existing directories. Not passed to Antigravity: ${addDirs.dropped.join(", ")}.`,
+      );
+    }
+    if (conversationId !== null && !knownHistory) {
+      // A conversation resumed from Antigravity's own store was never written by this plugin, so
+      // there is nothing to replay. The history is not lost: the CLI still holds it.
+      emitNotice(
+        session,
+        emit,
+        "history-unavailable",
+        "info",
+        "Earlier history is not shown",
+        "This conversation already existed in Antigravity, so its earlier turns are not part of Paseo's timeline and are not replayed. Antigravity still has them, and the next reply continues the conversation.",
+      );
+    }
+    if (config.systemPrompt && config.systemPrompt.trim().length > 0) {
+      emitNotice(
+        session,
+        emit,
+        "system-prompt-preamble",
+        "info",
+        "System prompt sent as a preamble",
+        "Antigravity has no system-prompt flag, so it is prepended to the first message of the conversation.",
+      );
+    }
 
-  emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
+    if (input.history === "replay" && session.transcript) {
+      // A child's rows are replayed with the row that spawned it, before the parent announces
+      // itself ready: a child session that arrived afterwards would be attached to a row the
+      // client had already drawn.
+      for (const item of session.transcript.list()) {
+        await replayItem(session, emit, item);
+      }
+    }
+
+    emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
+  } catch (error) {
+    // A session that failed to open is not one: nothing may list it as running, hold its id, or
+    // keep what it wrote.
+    await abandonSession(state, session);
+    throw error;
+  }
+}
+
+/**
+ * Undoes a session that never finished opening: it leaves the connection, and whatever it started
+ * or wrote is stopped and removed. Every step is attempted, whatever happens to the others.
+ */
+async function abandonSession(state: ConnectionState, session: Session): Promise<void> {
+  session.closing = true;
+  state.sessions.delete(session.sessionId);
+  stopContinuation(session);
+  for (const turn of session.pendingTurns) stopBackfill(turn);
+  for (const follow of session.follows.values()) follow.transcript.stop();
+  session.follows.clear();
+  const processes = [session.process, session.detached].filter((process) => process !== null);
+  session.process = null;
+  session.detached = null;
+  await Promise.allSettled(processes.map((process) => process.dispose()));
+  await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
+  await attempt("clear the attachments", () => clearAttachments(session.sessionId));
+  await attempt("release the MCP entries", () => releaseMcpServers(session.sessionId));
 }
 
 /** What a stored row knows about the child it spawned, as `refreshSubagentRow` wrote it. */
@@ -969,13 +1011,45 @@ async function syncSessionMcp(session: Session, emit: Emit): Promise<void> {
   );
 }
 
+/**
+ * Runs prompt work one prompt at a time, in the order the prompts arrived. Preparing a prompt
+ * awaits (a restart, an MCP sync, an attachment write), and two prompts preparing at once would
+ * each be judged against a session that has not yet seen the other. Work that fails does not stop
+ * the ones behind it.
+ */
+function enqueuePrompt(session: Session, work: () => Promise<void>): Promise<void> {
+  const run = session.promptChain.then(work);
+  session.promptChain = run.catch(() => undefined);
+  return run;
+}
+
 async function promptSession(
   input: Extract<ProviderInput, { type: "session.prompt" }>,
   state: ConnectionState,
   emit: Emit,
 ): Promise<void> {
   const session = requireSession(state, input.sessionId);
+  // A stop that arrives after this prompt did applies to it, even if it is still being prepared.
+  const epoch = session.interruptEpoch;
+  await enqueuePrompt(session, () => prepareAndStartPrompt(session, input, emit, epoch));
+}
+
+async function prepareAndStartPrompt(
+  session: Session,
+  input: Extract<ProviderInput, { type: "session.prompt" }>,
+  emit: Emit,
+  epoch: number,
+): Promise<void> {
+  if (session.closing) return;
   const { prompt } = input;
+  const stopped = (): boolean => {
+    if (session.interruptEpoch === epoch) return false;
+    failPrompt(session, emit, prompt.clientMessageId, {
+      message: "The prompt was stopped before it started",
+      code: "interrupted",
+    });
+    return true;
+  };
 
   // Which command the user picked decides the launch, so the list is read again here rather than
   // trusted from `session.open`: a skill may have been installed, removed, or renamed since.
@@ -1055,6 +1129,7 @@ async function promptSession(
   // The CLI reads the workspace MCP config at startup and only this path spawns one, so a toggle
   // change lands here; a turn queued behind a running one waits for its own relaunch instead.
   if (session.pendingTurns.length === 0) await syncSessionMcp(session, emit);
+  if (stopped()) return;
   // Typing a new message instead of answering the plan prompt is the user choosing to keep
   // planning, so the prompt is withdrawn rather than left to answer a plan that moved on.
   resolvePendingPlan(session, emit);
@@ -1088,6 +1163,7 @@ async function promptSession(
     return;
   }
 
+  if (stopped() || session.closing) return;
   await startTurn(session, emit, {
     shown: typed.length > 0 ? typed : text,
     text,
@@ -1128,7 +1204,16 @@ function createPendingTurn(session: Session, plan: boolean): PendingTurn {
     failureTimer: null,
     outgoing: "",
     plan,
+    announced: false,
+    carriesSystemPrompt: false,
   };
+}
+
+/** Tells the host the turn started, once. */
+function announceTurn(session: Session, emit: Emit, turn: PendingTurn): void {
+  if (turn.announced) return;
+  turn.announced = true;
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
 }
 
 async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
@@ -1149,17 +1234,19 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
       result: { type: "turn", turnId: turn.turnId },
     });
   }
-  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
 
   if (request.verbatim) {
     // The system prompt's preamble waits for the first plain message.
     turn.outgoing = request.text;
   } else {
-    turn.outgoing = buildOutgoingText(session, plan ? `${PLAN_MODE_PREAMBLE}\n\n${request.text}` : request.text);
+    const wanted = plan ? `${PLAN_MODE_PREAMBLE}\n\n${request.text}` : request.text;
+    turn.carriesSystemPrompt = !session.systemPromptSent && hasSystemPrompt(session);
+    turn.outgoing = buildOutgoingText(session, wanted);
     session.systemPromptSent = true;
   }
   // The detached CLI is carrying the conversation on, and the only way to hand this turn to a CLI
-  // would be to kill that one mid-way. The turn is announced now and written once it settles.
+  // would be to kill that one mid-way. The turn is accepted now and started once it is written,
+  // so the host is not told it is running while the conversation is busy with another turn.
   if (isContinuing(session) || session.deferred.length > 0) {
     console.log(`[antigravity] ${turn.turnId} waits for the conversation to finish carrying on`);
     session.deferred.push(turn);
@@ -1175,10 +1262,17 @@ async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn)
     // owed, and this turn must not be counted among them.
     const process = ensureProcess(session, emit);
     turn.schema = session.launchActive.schema;
+    // A turn queued behind another is started when that one is over, not when it is written.
+    if (session.pendingTurns.length === 0) announceTurn(session, emit, turn);
     session.pendingTurns.push(turn);
     await process.writeTurn(turn.outgoing);
   } catch (error) {
+    // The exit of the CLI may have failed the turn first; it ends once.
+    const owned = session.pendingTurns.includes(turn);
     session.pendingTurns = session.pendingTurns.filter((pending) => pending !== turn);
+    if (!owned && turn.announced) return;
+    releaseSystemPrompt(session, turn);
+    announceTurn(session, emit, turn);
     emit({
       type: "session.turn",
       sessionId: session.sessionId,
@@ -1187,6 +1281,11 @@ async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn)
       error: { message: describe(error), code: "agy_launch_failed" },
     });
   }
+}
+
+/** The system prompt travels with the first plain turn; one that never got an answer sends it again. */
+function releaseSystemPrompt(session: Session, turn: PendingTurn): void {
+  if (turn.carriesSystemPrompt && !turn.hadAssistantText) session.systemPromptSent = false;
 }
 
 /**
@@ -1227,6 +1326,7 @@ async function interruptSession(
   emit: Emit,
 ): Promise<void> {
   const session = requireSession(state, input.sessionId);
+  session.interruptEpoch += 1;
   // A continuation is the detached CLI's turn, so stopping it stops that CLI; its exit settles the
   // continuation and the turns deferred behind it (see `handleDetachedExit`).
   const process = session.process ?? (isContinuing(session) ? session.detached : null);
@@ -1299,6 +1399,10 @@ async function applyPendingRestart(session: Session): Promise<void> {
  * oldest pending turn, so a turn written to it could be settled by an answer that is not its own.
  */
 async function releaseDetached(session: Session): Promise<void> {
+  if (!session.detached) return;
+  // One last read first: the model may have been woken since the poll last looked, and what it did
+  // is lost for good once its CLI is gone. If it is in the middle of something, it is left alone.
+  await session.continuation?.tailer.drain();
   const detached = session.detached;
   if (!detached || isContinuing(session)) return;
   stopContinuation(session);
@@ -1479,8 +1583,8 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit, s
       state: "failed",
       error: settlement.error,
     });
-    void settleChildFollows(session, emit, turn, { state: "failed", error: settlement.error });
-    if (stuck) void stuck.dispose();
+    runInBackground("settle the subagents", settleChildFollows(session, emit, turn, { state: "failed", error: settlement.error }));
+    if (stuck) runInBackground("stop the CLI", stuck.dispose());
   } else {
     finalizeToolCalls(session, emit, turn, { status: "completed" });
     emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
@@ -1492,7 +1596,7 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit, s
   }
   // Turns written behind the settled one were queued inside the detached CLI and would never run
   // there, so they go to the fresh one instead. Their `started` was already announced.
-  if (queued.length > 0) void resendQueued(session, emit, queued);
+  if (queued.length > 0) runInBackground("send the queued turns", resendQueued(session, emit, queued));
 }
 
 /** Tells the user that a turn completed while a command it started still runs in the background. */
@@ -1523,7 +1627,7 @@ function isContinuing(session: Session): boolean {
  */
 function detachProcess(session: Session, emit: Emit, process: AgyProcess): void {
   stopContinuation(session);
-  if (session.detached) void session.detached.dispose();
+  if (session.detached) runInBackground("stop the previous CLI", session.detached.dispose());
   session.detached = process;
   const conversationId = session.conversationId;
   if (conversationId === null || session.closing) return;
@@ -1576,7 +1680,7 @@ function handleContinuationError(
   };
   finalizeToolCalls(session, emit, turn, { status: "failed", error });
   emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "failed", error });
-  if (session.deferred.length > 0) void sendDeferred(session, emit);
+  if (session.deferred.length > 0) runInBackground("send the deferred turns", sendDeferred(session, emit));
 }
 
 /**
@@ -1604,7 +1708,7 @@ function applyContinuation(
     console.log(
       `[antigravity] the conversation carried on after step ${continuation.settledStep}; publishing it as ${turn.turnId}`,
     );
-    emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "started" });
+    announceTurn(session, emit, turn);
   }
   const render = renderBackfill(
     past,
@@ -1625,7 +1729,7 @@ function applyContinuation(
   session.settledStep = Math.max(session.settledStep, finalStep);
   finalizeToolCalls(session, emit, turn, { status: "completed" });
   emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
-  if (session.deferred.length > 0) void sendDeferred(session, emit);
+  if (session.deferred.length > 0) runInBackground("send the deferred turns", sendDeferred(session, emit));
 }
 
 /** Writes the turns deferred behind a continuation to a fresh CLI, in the order they were sent. */
@@ -1662,10 +1766,10 @@ function handleDetachedExit(session: Session, emit: Emit): void {
       error,
     });
     // A held turn's children were spawned by the CLI that is gone, as for a turn it was streaming.
-    void settleChildFollows(session, emit, turn, { state: canceled ? "canceled" : "failed", error });
+    runInBackground("settle the subagents", settleChildFollows(session, emit, turn, { state: canceled ? "canceled" : "failed", error }));
   }
   if (!canceled) {
-    if (session.deferred.length > 0) void sendDeferred(session, emit);
+    if (session.deferred.length > 0) runInBackground("send the deferred turns", sendDeferred(session, emit));
     return;
   }
   const deferred = session.deferred;
@@ -1734,15 +1838,18 @@ async function respondToPermission(
 
   session.selection.mode = IMPLEMENT_MODE_ID;
   emit({ type: "session.config", sessionId: session.sessionId, config: configState(session) });
-  // The mode is a launch flag, and the implementing turn is a plain message.
-  session.launchPending = { schema: false, commands: false, skillDir: null };
-  if (session.process?.running) session.needsRestart = true;
-  await releaseDetached(session);
-  await applyPendingRestart(session);
-  await startTurn(session, emit, {
-    shown: IMPLEMENT_PLAN_TEXT,
-    text: IMPLEMENT_PLAN_TEXT,
-    verbatim: false,
+  await enqueuePrompt(session, async () => {
+    if (session.closing) return;
+    // The mode is a launch flag, and the implementing turn is a plain message.
+    session.launchPending = { schema: false, commands: false, skillDir: null };
+    if (session.process?.running) session.needsRestart = true;
+    await releaseDetached(session);
+    await applyPendingRestart(session);
+    await startTurn(session, emit, {
+      shown: IMPLEMENT_PLAN_TEXT,
+      text: IMPLEMENT_PLAN_TEXT,
+      verbatim: false,
+    });
   });
 }
 
@@ -1770,13 +1877,14 @@ async function closeSession(
   session.follows.clear();
   for (const follow of children) follow.transcript.stop();
 
-  await session.transcript?.flush();
-  for (const follow of children) await follow.store?.flush();
-  await rm(session.schemaPath, { force: true });
-  await clearAttachments(session.sessionId);
-  await releaseMcpServers(session.sessionId);
-  if (process) await process.dispose();
-  if (detached) await detached.dispose();
+  // A session closes whatever goes wrong while it is cleaned up after: each step is attempted, the
+  // CLI is stopped whatever became of the rows before it, and the host is told at the end.
+  await attempt("write the timeline", () => session.transcript?.flush());
+  for (const follow of children) await attempt("write a subagent's timeline", () => follow.store?.flush());
+  await Promise.allSettled([process?.dispose(), detached?.dispose()]);
+  await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
+  await attempt("clear the attachments", () => clearAttachments(session.sessionId));
+  await attempt("release the MCP entries", () => releaseMcpServers(session.sessionId));
 
   // Every child that settled already closed its own session and left this set, so what is left is
   // a child that was still running: closing it silently would tell the host it completed.
@@ -1800,7 +1908,7 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
     // settle those turns and replace it. Its own exit is ignored below: it no longer owns the
     // session, and failing the new process's turns from it would be wrong.
     handleAgyExit(session, { code: null, signal: null }, emit);
-    void current.dispose();
+    runInBackground("stop the previous CLI", current.dispose());
   }
 
   const process = new AgyProcess(
@@ -1819,13 +1927,29 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
       skillDir: session.launchPending.skillDir ?? undefined,
       extraArgs: session.extraArgs,
       binary: session.agyPath,
+      terminateGraceMs: session.timing.terminateGraceMs,
+      drainGraceMs: session.timing.drainGraceMs,
     },
     {
       // A replaced CLI keeps writing events and stderr until it dies; none of it belongs to the
       // turns of the process that replaced it.
       onEvent: (event) => {
         if (session.process !== process) return;
-        handleAgyEvent(session, event, emit);
+        // Runs from the CLI's output reader, where a throw would be an uncaught exception in the
+        // plugin host — and the host does throw here when it refuses an event.
+        try {
+          handleAgyEvent(session, event, emit);
+        } catch (error) {
+          try {
+            failEverythingPending(session, emit, process, {
+              message: `The Antigravity provider failed while handling the CLI's output: ${describe(error)}`,
+              code: "internal_error",
+            });
+          } catch (again) {
+            // The host refuses the failure too; the CLI is already stopped, and nothing else can be done.
+            console.error(`[antigravity] could not report the failure either: ${describe(again)}`);
+          }
+        }
       },
       onStderr: (line) => {
         if (session.process !== process) return;
@@ -1884,17 +2008,33 @@ function handleAgyEvent(session: Session, event: AgyEvent, emit: Emit): void {
     case "result":
       handleResult(session, event.result, emit);
       return;
-    default:
+    case "malformed": {
+      console.error(`[antigravity] dropping a ${event.event} line it cannot decode: ${event.reason}`);
+      // A result ends a turn, and the CLI stays up waiting for the next line whatever it printed,
+      // so a turn whose result is unreadable would otherwise run forever.
+      const process = session.process;
+      if (event.event === "result" && process) {
+        failEverythingPending(session, emit, process, {
+          message: `Antigravity sent a result that could not be decoded (${event.reason})`,
+          code: "agy_protocol",
+        });
+      }
+      return;
+    }
+    case "unknown":
+      console.log(`[antigravity] ignoring an ${event.event} event this plugin does not know`);
       return;
   }
 }
 
 function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): void {
-  console.log(
-    `[antigravity] step idx=${step.step_index} ${step.state} ${step.step_type}` +
-      `${step.text_delta ? ` delta=${step.text_delta.length}` : " (no text)"}` +
-      `${step.tool_name ? ` tool=${step.tool_name}` : ""}`,
-  );
+  // A streamed answer is one step reported once per chunk: only what is not a chunk is worth a line.
+  if (!step.text_delta) {
+    console.log(
+      `[antigravity] step idx=${step.step_index} ${step.state} ${step.step_type}` +
+        `${step.tool_name ? ` tool=${step.tool_name}` : ""}`,
+    );
+  }
 
   const turn = session.pendingTurns[0];
   if (turn) {
@@ -2370,9 +2510,11 @@ function handleChildRender(
     });
     closeChildSession(session, emit, follow);
     follow.transcript.stop();
+    // A finished child is not followed again, and nothing is left to settle for it later.
+    session.follows.delete(follow.rowId);
     // The child's rows are complete here, so they no longer have to wait out the write debounce:
     // a session closed right after this still replays everything the child said.
-    void follow.store?.flush();
+    runInBackground("write a subagent's timeline", Promise.resolve(follow.store?.flush()));
   }
 }
 
@@ -2390,7 +2532,7 @@ function handleChildLost(session: Session, emit: Emit, follow: ChildFollow, reas
   });
   // What the child did say is its history whatever ended it, so it is written out now rather than
   // left to a debounce that may never fire.
-  void follow.store?.flush();
+  runInBackground("write a subagent's timeline", Promise.resolve(follow.store?.flush()));
   closeChildSession(session, emit, follow, error);
 }
 
@@ -2419,7 +2561,7 @@ async function settleChildFollows(
     follow.transcript.stop();
     // The child said everything it is going to say, so its rows are written out now rather than
     // left to a debounce this session may not live long enough to see.
-    void follow.store?.flush();
+    runInBackground("write a subagent's timeline", Promise.resolve(follow.store?.flush()));
     if (session.closing || follow.done || !follow.opened) continue;
     emit({
       type: "session.turn",
@@ -2493,41 +2635,84 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     finalizeToolCalls(session, emit, turn, { status: "completed" });
     emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
     if (!turn.schema) offerPlan(session, emit, turn, lastAssistantText(turn) || response);
+    startNextPending(session, emit);
     return;
   }
 
-  if (isInterrupted(result)) {
-    publishBufferedAnswer(session, emit, turn);
-    finalizeToolCalls(session, emit, turn, { status: "canceled" });
-    emit({
-      type: "session.turn",
-      sessionId: session.sessionId,
-      turnId: turn.turnId,
-      state: "canceled",
-      error: { message: "Interrupted" },
+  // agy reports an interrupt as a failed result with a fixed error string, and the user asking for
+  // one is what says that is what this is, so the words agy chose are not the only thing judged.
+  const interrupted = isInterrupted(result) || session.interrupting;
+  if (interrupted) {
+    endTurn(session, emit, turn, { state: "canceled", error: { message: "Interrupted" } });
+  } else {
+    const { error, retryable } = turnFailure(session, {
+      message: result.error ?? `Antigravity reported ${result.status}`,
+      code: result.status,
     });
-    void settleChildFollows(session, emit, turn, {
-      state: "canceled",
-      error: { message: "Interrupted" },
-    });
-    return;
+    endTurn(session, emit, turn, { state: "failed", error });
+    if (retryable) emitUnavailableNotice(session, emit);
   }
+  startNextPending(session, emit);
+  // agy exits after an error result, and the exit is reported a moment later. A turn sent in that
+  // moment would be written to a CLI that will never read it, so this one is not used again. What
+  // is queued behind the turn that ended is left to the exit, which settles it.
+  const process = session.process;
+  if (process && session.pendingTurns.length === 0) retireProcess(session, process);
+}
 
-  const { error, retryable } = turnFailure(session, {
-    message: result.error ?? `Antigravity reported ${result.status}`,
-    code: result.status,
-  });
+/** How a turn ended without an answer. */
+type TurnOutcome = { state: "canceled" | "failed"; error: ProviderError };
+
+/**
+ * Ends a turn that did not complete: whatever the model said is published, the tool rows it left
+ * open are settled to match, the host is told, and the subagents it spawned are settled with it.
+ */
+function endTurn(session: Session, emit: Emit, turn: PendingTurn, outcome: TurnOutcome): void {
+  stopBackfill(turn);
   publishBufferedAnswer(session, emit, turn);
-  finalizeToolCalls(session, emit, turn, { status: "failed", error });
+  releaseSystemPrompt(session, turn);
+  finalizeToolCalls(
+    session,
+    emit,
+    turn,
+    outcome.state === "canceled" ? { status: "canceled" } : { status: "failed", error: outcome.error },
+  );
+  announceTurn(session, emit, turn);
   emit({
     type: "session.turn",
     sessionId: session.sessionId,
     turnId: turn.turnId,
-    state: "failed",
-    error,
+    state: outcome.state,
+    error: outcome.error,
   });
-  void settleChildFollows(session, emit, turn, { state: "failed", error });
-  if (retryable) emitUnavailableNotice(session, emit);
+  // The process that was serving the turn is gone or going, so the children it spawned can no
+  // longer be followed. Their transcripts get one last read first: a child that finished while the
+  // process died is still finished.
+  runInBackground("settle the subagents", settleChildFollows(session, emit, turn, outcome));
+}
+
+/** The turn now at the front of the queue starts, now that the one before it is over. */
+function startNextPending(session: Session, emit: Emit): void {
+  const next = session.pendingTurns[0];
+  if (next) announceTurn(session, emit, next);
+}
+
+/** Stops using a CLI: a fresh one serves the next turn, and this one is stopped in the background. */
+function retireProcess(session: Session, process: AgyProcess): void {
+  if (session.process === process) session.process = null;
+  runInBackground("stop the CLI", process.dispose());
+}
+
+/**
+ * Ends every turn a CLI still owes with `error` and stops using it. For a CLI whose state can no
+ * longer be trusted — it sent something unreadable, or the provider failed while handling it.
+ */
+function failEverythingPending(session: Session, emit: Emit, process: AgyProcess, error: ProviderError): void {
+  console.error(`[antigravity] ${error.message}`);
+  const pending = session.pendingTurns;
+  session.pendingTurns = [];
+  retireProcess(session, process);
+  for (const turn of pending) endTurn(session, emit, turn, { state: "failed", error });
 }
 
 function handleAgyExit(
@@ -2556,31 +2741,7 @@ function handleAgyExit(
     : turnFailure(session, { message: detail, code: "agy_exit" });
 
   for (const turn of pending) {
-    stopBackfill(turn);
-    publishBufferedAnswer(session, emit, turn);
-    const canceled = session.interrupting;
-    finalizeToolCalls(
-      session,
-      emit,
-      turn,
-      canceled ? { status: "canceled" } : { status: "failed", error: failure.error },
-    );
-    emit({
-      type: "session.turn",
-      sessionId: session.sessionId,
-      turnId: turn.turnId,
-      state: canceled ? "canceled" : "failed",
-      error: failure.error,
-    });
-    // The process that was serving the turn is gone, so the children it spawned can no longer be
-    // followed. Their transcripts get one last read first: a child that finished while the process
-    // died is still finished.
-    void settleChildFollows(
-      session,
-      emit,
-      turn,
-      canceled ? { state: "canceled", error: failure.error } : { state: "failed", error: failure.error },
-    );
+    endTurn(session, emit, turn, { state: session.interrupting ? "canceled" : "failed", error: failure.error });
   }
   if (failure.retryable) emitUnavailableNotice(session, emit);
 }
@@ -2939,6 +3100,10 @@ async function checkAddDirs(
 }
 
 /** Antigravity has no system-prompt flag, so it is prepended to the first turn of a conversation. */
+function hasSystemPrompt(session: Session): boolean {
+  return (session.config.systemPrompt?.trim().length ?? 0) > 0;
+}
+
 function buildOutgoingText(session: Session, text: string): string {
   if (session.systemPromptSent) return text;
   const systemPrompt = session.config.systemPrompt?.trim();
@@ -3073,4 +3238,21 @@ function describeInput(input: ProviderInput): string {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Lets work nobody waits for run, with its failure logged: a rejection left on a promise that is
+ * not awaited is an unhandled rejection in the plugin host.
+ */
+function runInBackground(label: string, work: Promise<unknown>): void {
+  work.catch((error: unknown) => console.error(`[antigravity] could not ${label}: ${describe(error)}`));
+}
+
+/** Runs one step of a teardown so that its failure cannot skip the steps after it. */
+async function attempt(label: string, work: () => Promise<unknown> | unknown): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    console.error(`[antigravity] could not ${label}: ${describe(error)}`);
+  }
 }

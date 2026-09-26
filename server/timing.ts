@@ -17,10 +17,16 @@ export interface Timing {
    * apart), so the first error is not the end.
    */
   failureQuietMs: number;
+  /** How long a CLI asked to stop may take to flush its conversation and exit before it is killed. */
+  terminateGraceMs: number;
+  /** How long the exit of a CLI waits for its output to end, which something it started can hold open. */
+  drainGraceMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
   backfillDelayMs: 5_000,
   transcriptPollMs: 1_000,
   failureQuietMs: 30_000,
+  terminateGraceMs: 3_000,
+  drainGraceMs: 2_000,
 };

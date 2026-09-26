@@ -34,6 +34,13 @@ export interface AgyLaunchConfig {
   allowSlashCommands?: boolean;
   extraArgs?: readonly string[];
   binary?: string;
+  /** How long a process asked to stop may take before it is killed. Defaults to `TERMINATE_GRACE_MS`. */
+  terminateGraceMs?: number;
+  /**
+   * How long the exit of a process waits for its output to end. Something the CLI started can
+   * keep the pipes open after the CLI itself is gone. Defaults to `DRAIN_GRACE_MS`.
+   */
+  drainGraceMs?: number;
 }
 
 export interface AgyProcessHandlers {
@@ -43,15 +50,23 @@ export interface AgyProcessHandlers {
 }
 
 /**
- * The daemon is started by a GUI app and may not inherit `~/.local/bin` on its PATH, so an
- * explicit lookup is required before falling back to PATH resolution.
+ * Where `agy` is looked for besides the PATH: the daemon is started by a GUI app and may not
+ * inherit the directories a shell adds, which is where the installer (`~/.local/bin`) and Homebrew
+ * (`/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel) put it.
  */
-export function resolveAgyBinary(explicit?: string): string {
+export function defaultBinaryDirs(): string[] {
+  return [join(homedir(), ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"];
+}
+
+/** The binary to launch: an explicit path, the environment's, the first known directory holding one, else `agy` on the PATH. */
+export function resolveAgyBinary(explicit?: string, dirs: readonly string[] = defaultBinaryDirs()): string {
   if (explicit && explicit.trim().length > 0) return explicit;
   const fromEnv = process.env.PASEO_ANTIGRAVITY_BIN;
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
-  const local = join(homedir(), ".local", "bin", "agy");
-  if (existsSync(local)) return local;
+  for (const dir of dirs) {
+    const candidate = join(dir, "agy");
+    if (existsSync(candidate)) return candidate;
+  }
   return "agy";
 }
 
@@ -93,7 +108,12 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
   return args;
 }
 
+/** How long an interrupted process may take to report `interrupted` before it is killed. */
 const SIGKILL_GRACE_MS = 5_000;
+/** How long a process asked to stop may take to flush and exit before it is killed. */
+export const TERMINATE_GRACE_MS = 3_000;
+/** How long the exit of a process waits for its output pipes to end. */
+export const DRAIN_GRACE_MS = 2_000;
 
 /**
  * One `agy` child process speaking NDJSON on stdin/stdout. A single process serves a whole
@@ -115,6 +135,10 @@ export class AgyProcess {
   private stdinClosed = false;
   private readersPending = 0;
   private reported = false;
+  private drainTimer: NodeJS.Timeout | null = null;
+  private drainExpired = false;
+  /** Whether the process leads a process group of its own, which is what lets its children be reached. */
+  private grouped = false;
 
   constructor(
     private readonly config: AgyLaunchConfig,
@@ -147,16 +171,20 @@ export class AgyProcess {
     this.stdinClosed = false;
     this.readersPending = 0;
     this.reported = false;
+    this.drainExpired = false;
     this.exitInfo = { code: null, signal: null };
 
     const binary = this.binary;
     const args = buildAgyArgs(this.config);
     console.log(`[antigravity] spawn ${binary} ${args.join(" ")} (cwd ${this.config.cwd})`);
 
+    // Its own process group, so stopping the CLI can stop what it started too.
+    this.grouped = process.platform !== "win32";
     const child = spawn(binary, args, {
       cwd: this.config.cwd,
       env: { ...process.env, ...this.config.env } as NodeJS.ProcessEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: this.grouped,
     });
     this.child = child;
     this.exitPromise = new Promise<void>((resolve) => {
@@ -200,6 +228,16 @@ export class AgyProcess {
     child.on("exit", (code, signal) => {
       this.exitInfo = { code, signal };
       this.processExited = true;
+      // Whatever the CLI started may hold its output open long after it is gone; the exit is
+      // reported once that has had `drainGraceMs` to end.
+      if (!this.reported && this.readersPending > 0) {
+        this.drainTimer = setTimeout(() => {
+          this.drainTimer = null;
+          this.drainExpired = true;
+          this.reportExitIfDrained();
+        }, this.config.drainGraceMs ?? DRAIN_GRACE_MS);
+        this.drainTimer.unref();
+      }
       this.reportExitIfDrained();
     });
   }
@@ -227,32 +265,59 @@ export class AgyProcess {
 
   /** Interrupt the running turn. agy reports `result.error = "interrupted"` and exits. */
   async interrupt(): Promise<void> {
-    const child = this.child;
-    if (!child) return;
-    const exited = this.exitPromise;
-
-    child.kill("SIGINT");
-    const timer = setTimeout(() => {
-      if (this.child) this.child.kill("SIGKILL");
-    }, SIGKILL_GRACE_MS);
-
-    try {
-      if (exited) await Promise.race([exited, delay(SIGKILL_GRACE_MS + 1_000)]);
-    } finally {
-      clearTimeout(timer);
+    if (!this.child) return;
+    // The CLI alone gets the interrupt: it reports the turn as interrupted and shuts down what it
+    // started itself. Only a CLI that does not answer is killed with everything it started.
+    this.child.kill("SIGINT");
+    if (!(await this.waitForExit(SIGKILL_GRACE_MS))) {
+      this.signal("SIGKILL");
+      await this.waitForExit(SIGKILL_GRACE_MS);
     }
   }
 
-  /** Terminate immediately and release streams. Safe to call repeatedly. */
+  /**
+   * Stops the process and what it started, and releases its streams. It is asked to stop first, so
+   * it can flush the conversation it was writing, and killed if it has not gone by the grace
+   * period. Safe to call repeatedly.
+   */
   async dispose(): Promise<void> {
     this.disposed = true;
     const child = this.child;
-    const exited = this.exitPromise;
-    if (child) {
-      child.stdin?.end();
-      child.kill("SIGKILL");
+    if (!child) return;
+    child.stdin?.end();
+    this.signal("SIGTERM");
+    if (!(await this.waitForExit(this.config.terminateGraceMs ?? TERMINATE_GRACE_MS))) {
+      this.signal("SIGKILL");
+      await this.waitForExit(SIGKILL_GRACE_MS);
     }
-    if (exited) await Promise.race([exited, delay(SIGKILL_GRACE_MS)]);
+  }
+
+  /** Signals the CLI and, when it leads a process group, everything in it. */
+  private signal(signal: NodeJS.Signals): void {
+    const child = this.child;
+    if (!child) return;
+    try {
+      if (this.grouped && child.pid !== undefined) process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch {
+      // Already gone: there is nothing left to signal.
+    }
+  }
+
+  /** Whether the process has exited and its exit was reported, within `ms`. */
+  private async waitForExit(ms: number): Promise<boolean> {
+    const exited = this.exitPromise;
+    if (!exited || !this.child) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([exited.then(() => true), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private readerClosed(): void {
@@ -267,16 +332,14 @@ export class AgyProcess {
    */
   private reportExitIfDrained(): void {
     if (this.reported) return;
-    if (!this.processExited || this.readersPending > 0) return;
+    if (!this.processExited || (this.readersPending > 0 && !this.drainExpired)) return;
     this.reported = true;
+    if (this.drainTimer) clearTimeout(this.drainTimer);
+    this.drainTimer = null;
     this.child = null;
     const resolve = this.resolveExit;
     this.resolveExit = null;
     this.handlers.onExit(this.exitInfo);
     resolve?.();
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -7,7 +7,7 @@
  *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
- *                        | background
+ *                        | background | usage-null | bad-result | child | grandchild-pipe
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all), or
@@ -36,11 +36,17 @@
  *                        model cancels it before answering) | trailing (notices after the answer)
  *                        | error (the transcript ends on a model error) | error-recovers
  *   FAKE_BACKGROUND_FINAL_GATE  file `finish` waits for before the model's new final answer
+ *   FAKE_PID_FILE        when set, the process id is written here, so a test can tell whether it is gone
+ *   FAKE_EXIT_DELAY_MS   how long after an error result the `error` scenario lingers before exiting
+ *                        (agy exits after every error result, not at once); default 0
+ *   FAKE_INTERRUPT_ERROR error text of the result an interrupted turn reports (default "interrupted")
+ *   FAKE_CHILD_PID_FILE  the `child` scenario starts a grandchild and writes its pid here
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
  *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
  */
+import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
@@ -58,6 +64,10 @@ if (process.env.FAKE_ARGV_FILE) {
 // Every launch, in order: a restart test needs to see the flags of each process, not just the last.
 if (process.env.FAKE_ARGV_LOG) {
   appendFileSync(process.env.FAKE_ARGV_LOG, `${JSON.stringify(argv)}\n`, "utf8");
+}
+
+if (process.env.FAKE_PID_FILE) {
+  writeFileSync(process.env.FAKE_PID_FILE, String(process.pid), "utf8");
 }
 
 /** The schema file `--json-schema` points at, when this process was launched with one. */
@@ -343,7 +353,7 @@ if (
           conversation_id: conversationId,
           status: "ERROR",
           response: "",
-          error: "interrupted",
+          error: process.env.FAKE_INTERRUPT_ERROR ?? "interrupted",
           duration_seconds: 0,
           num_turns: turns,
           usage,
@@ -658,6 +668,37 @@ readline.createInterface({ input }).on("line", async (line) => {
     return;
   }
 
+  if (scenario === "usage-null") {
+    // A `result` whose usage has a field of the wrong type: the turn still ended, and must end.
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: "fine" }));
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "\n" }));
+    send({ event: "result", result: { conversation_id: conversationId, status: "SUCCESS", response: "fine\n", num_turns: turns, usage: { input_tokens: null, output_tokens: 27 } } });
+    return;
+  }
+
+  if (scenario === "bad-result") {
+    // A `result` with no status at all. agy stays alive, as it does with `--print-timeout 0`.
+    send({ event: "result", result: { conversation_id: conversationId, response: "?", usage } });
+    return;
+  }
+
+  if (scenario === "child") {
+    // A tool that left a process of its own behind, which only the process group can reach.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    if (process.env.FAKE_CHILD_PID_FILE) writeFileSync(process.env.FAKE_CHILD_PID_FILE, String(child.pid), "utf8");
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: "started a child" }));
+    return;
+  }
+
+  if (scenario === "grandchild-pipe") {
+    // agy exits while a process it started still holds its stdout: the pipe stays open for seconds.
+    spawn(process.execPath, ["-e", "setTimeout(() => {}, 4000)"], { stdio: ["ignore", "inherit", "inherit"] });
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "bye" }));
+    sendResult(turnResult(turns, "bye"));
+    setTimeout(() => process.exit(0), 20);
+    return;
+  }
+
   if (scenario === "error") {
     sendResult({
       conversation_id: conversationId,
@@ -668,6 +709,8 @@ readline.createInterface({ input }).on("line", async (line) => {
       num_turns: turns,
       usage,
     });
+    // agy exits after an error result, and reports the exit a moment later.
+    setTimeout(() => process.exit(1), Number(process.env.FAKE_EXIT_DELAY_MS ?? 0));
     return;
   }
 
