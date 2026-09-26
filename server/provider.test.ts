@@ -46,6 +46,8 @@ const OFFERED = [
   "session.configure",
   "session.list",
   "session.persistence",
+  "session.archive",
+  "session.unarchive",
   "permission",
   "permission.tool_policy",
 ];
@@ -2058,6 +2060,116 @@ describe("session import", () => {
           updatedAt: "2026-09-23T15:45:49.636Z",
         },
       ],
+    });
+  });
+
+  describe("archiving", () => {
+    const persistence = { version: 1, data: { conversationId: IMPORTED_ID } } as const;
+    const listed = async (connection: ProviderConnection, events: ProviderEvent[], requestId: string) => {
+      const before = events.length;
+      await connection.send({ type: "sessions", requestId, cwd: tempDir } as ProviderInput);
+      const reply = events
+        .slice(before)
+        .find((event): event is Extract<ProviderEvent, { type: "sessions" }> => event.type === "sessions");
+      return reply?.sessions.map((session) => readConversationIdOf(session.persistence)) ?? [];
+    };
+    const readConversationIdOf = (value: ProviderPersistence): unknown =>
+      (value.data as { conversationId?: unknown }).conversationId;
+
+    it("offers archive and unarchive when the host does", async () => {
+      const { connection } = await connect();
+      expect(connection.capabilities).toEqual(expect.arrayContaining(["session.archive", "session.unarchive"]));
+    });
+
+    it("stops offering an archived conversation for import, and offers it again once unarchived", async () => {
+      seedConversations();
+      const { connection, events } = await connect();
+      expect(await listed(connection, events, "l1")).toEqual([IMPORTED_ID]);
+
+      await connection.send({ type: "session.archive", requestId: "a1", persistence } as ProviderInput);
+      expect(events.some((event) => event.type === "request.completed" && event.requestId === "a1")).toBe(true);
+      expect(await listed(connection, events, "l2")).toEqual([]);
+
+      await connection.send({ type: "session.unarchive", requestId: "u1", persistence } as ProviderInput);
+      expect(events.some((event) => event.type === "request.completed" && event.requestId === "u1")).toBe(true);
+      expect(await listed(connection, events, "l3")).toEqual([IMPORTED_ID]);
+    });
+
+    it("remembers what was archived across a reload", async () => {
+      seedConversations();
+      const first = await connect();
+      await first.connection.send({ type: "session.archive", requestId: "a1", persistence } as ProviderInput);
+      await first.connection.close();
+
+      const second = await connect();
+      expect(await listed(second.connection, second.events, "l1")).toEqual([]);
+    });
+
+    it("archives a conversation once however often it is asked to", async () => {
+      seedConversations();
+      const { connection, events } = await connect();
+      await connection.send({ type: "session.archive", requestId: "a1", persistence } as ProviderInput);
+      await connection.send({ type: "session.archive", requestId: "a2", persistence } as ProviderInput);
+      await connection.send({ type: "session.unarchive", requestId: "u1", persistence } as ProviderInput);
+      // One unarchive undoes any number of archives.
+      expect(await listed(connection, events, "l1")).toEqual([IMPORTED_ID]);
+    });
+
+    it("fails a request whose persistence names no conversation", async () => {
+      const { connection, events } = await connect();
+      await connection.send({
+        type: "session.archive",
+        requestId: "a1",
+        persistence: { version: 1, data: {} },
+      } as ProviderInput);
+      expect(events.find((event) => event.type === "request.failed" && event.requestId === "a1")).toMatchObject({
+        error: { code: "invalid_persistence" },
+      });
+    });
+
+    it("keeps the stored timeline, so an unarchived conversation replays as it did", async () => {
+      const { connection, events } = await connect();
+      await openSession(connection);
+      await prompt(connection, "hello");
+      await waitFor(() => turns(events, "completed")[0], "the first turn");
+      await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+
+      const conversation = { version: 1, data: { conversationId: "11111111-2222-3333-4444-555555555555" } } as const;
+      await connection.send({ type: "session.archive", requestId: "a1", persistence: conversation } as ProviderInput);
+      await connection.send({ type: "session.unarchive", requestId: "u1", persistence: conversation } as ProviderInput);
+      await openSession(connection, {}, { sessionId: "session-2", history: "replay", persistence: conversation });
+
+      expect(
+        timelineItems(events).filter((item) => item.type === "user_message" && item.text === "hello").length,
+      ).toBeGreaterThan(1);
+    });
+
+    it("lists the requested number of conversations even when newer ones are archived", async () => {
+      const home = join(tempDir, "home");
+      process.env.HOME = home;
+      const ids = ["a", "b", "c", "d"].map((letter) => `${letter.repeat(8)}-0000-4000-8000-000000000000`);
+      writeConversationDb(
+        home,
+        ids.map((conversationId, index) => ({
+          conversationId,
+          title: `Conversation ${index}`,
+          preview: "",
+          lastModifiedTime: `2026-09-23 1${index}:00:00+00:00`,
+          workspacePaths: [tempDir],
+        })),
+      );
+      const { connection, events } = await connect();
+      // The two newest are archived: a limit of two must still find the two that are left.
+      for (const id of [ids[3], ids[2]]) {
+        await connection.send({
+          type: "session.archive",
+          requestId: `a-${id}`,
+          persistence: { version: 1, data: { conversationId: id } },
+        } as ProviderInput);
+      }
+      await connection.send({ type: "sessions", requestId: "l1", cwd: tempDir, limit: 2 } as ProviderInput);
+      const reply = events.find((event): event is Extract<ProviderEvent, { type: "sessions" }> => event.type === "sessions");
+      expect(reply?.sessions.map((session) => readConversationIdOf(session.persistence))).toEqual([ids[1], ids[0]]);
     });
   });
 

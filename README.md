@@ -66,6 +66,7 @@ CLI started goes with it, but a plugin process that is itself killed cannot clea
 | `session.persistence` | The conversation id agy reports is persisted, so reopening an agent resumes the same Antigravity conversation. |
 | `session.subsession` | Each subagent an `invoke_subagent` call starts is shown as a child session of the agent that spawned it, linked to its row, and follows the child's own transcript live (see [Subagents](#subagents)). |
 | `permission` | Used only for plan approval: a plan-mode turn ends with an *Implement this plan?* prompt (see [Plan mode](#plan-mode)). agy's own tool approvals cannot be surfaced. |
+| `session.archive` / `session.unarchive` | Antigravity has no archive of its own, so the plugin keeps the list (`archived.json`): an archived conversation is left out of what `session.list` offers for import, and unarchiving offers it again. The conversation, and the timeline the plugin stored for it, are not touched, so unarchiving brings back exactly what archiving hid. |
 | `permission.tool_policy` | Accepted (Paseo rejects a session carrying a tool policy otherwise), but preapproved MCP tools cannot be forwarded: agy reads its own rules from `settings.json`. |
 
 Models come from `agy models` (cached for 10 minutes against the resolved binary's path and
@@ -270,6 +271,7 @@ Under `$PASEO_HOME` (default `~/.paseo`), in `plugin-data/antigravity-cli/`:
 | `transcripts/<conversationId>.jsonl` | The timeline rows of a conversation, so `history: "replay"` can restore them after a reload — a subagent's child session is stored the same way, under the subagent's own conversation id. Newest snapshot per row id, capped at 500 rows (a first line says so when older rows were dropped, and a replay tells you), flushed on close, replaced atomically and readable by you alone. A row that was still running when the plugin went away replays as canceled. Not written when the session has `persist: false`. |
 | `attachments/<sessionId>/<n>.<ext>` | Images decoded from prompts, up to 25 MiB each. Deleted on `session.close`, and swept a week after last use when the session never came back. |
 | `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with. Deleted on `session.close`, and swept like attachments. |
+| `archived.json` | The ids of the conversations Paseo archived, which `session.list` leaves out. |
 | `mcp/<sessionId>/.agents/mcp_config.json` | Only while sharing is on: the session's MCP entries, with their credentials. Deleted on `session.close` and when the connection ends. |
 
 The plugin reads three things outside those directories: the `toolPermission` value in

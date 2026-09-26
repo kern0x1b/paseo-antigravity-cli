@@ -29,6 +29,11 @@ export interface ConversationQuery {
   cwd?: string;
   query?: string;
   limit?: number;
+  /**
+   * Conversations to leave out. Applied before the limit, so a limit of N still finds N
+   * conversations when the newest ones are excluded.
+   */
+  exclude?: (conversationId: string) => boolean;
 }
 
 /**
@@ -45,6 +50,7 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
 
   const summaries: ProviderSessionSummary[] = [];
   for (const row of rows) {
+    if (options.exclude?.(row.conversation_id)) continue;
     const workspace = firstWorkspacePath(row.workspace_uris);
     if (
       wantedCwd !== undefined &&

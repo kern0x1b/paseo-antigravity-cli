@@ -22,6 +22,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { conversationTranscriptPath, modelActed, renderBackfill, stepsPast } from "./backfill";
 import { AgyProcess } from "./agy";
+import { archiveConversation, archivedConversations, unarchiveConversation } from "./archive";
 import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
 import {
@@ -136,6 +137,10 @@ const CAPABILITIES = [
   // Antigravity's own conversation index is readable, which is what makes import possible.
   "session.list",
   "session.persistence",
+  // Antigravity has no archive of its own, so archiving hides a conversation from the list offered
+  // for import (see `archive.ts`).
+  "session.archive",
+  "session.unarchive",
   // A subagent run is followed through the transcript agy writes for its own conversation, and is
   // published as a child session under the invoke_subagent row that spawned it.
   "session.subsession",
@@ -565,14 +570,25 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
     case "catalog":
       emit({ type: "catalog", requestId: input.requestId, catalog: await buildCatalog() });
       return;
-    case "sessions":
+    case "sessions": {
+      // A conversation a session is running, or one that was archived, is not one to import.
+      const running = runningConversations(state);
+      const archived = await archivedConversations();
       emit({
         type: "sessions",
         requestId: input.requestId,
-        sessions: listConversations({ cwd: input.cwd, query: input.query, limit: input.limit }).filter(
-          (summary) => !runningConversations(state).has(readConversationId(summary.persistence) ?? ""),
-        ),
+        sessions: listConversations({
+          cwd: input.cwd,
+          query: input.query,
+          limit: input.limit,
+          exclude: (id) => running.has(id) || archived.has(id),
+        }),
       });
+      return;
+    }
+    case "session.archive":
+    case "session.unarchive":
+      await setArchived(input, emit);
       return;
     case "session.open":
       await openSession(input, state, emit);
@@ -595,6 +611,34 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
     default:
       throw new Error(`Unsupported provider input: ${(input as { type: string }).type}`);
   }
+}
+
+/** Archives or unarchives the conversation a request names, and says how it went. */
+async function setArchived(
+  input: Extract<ProviderInput, { type: "session.archive" | "session.unarchive" }>,
+  emit: Emit,
+): Promise<void> {
+  const conversationId = readConversationId(input.persistence);
+  if (conversationId === null) {
+    emit({
+      type: "request.failed",
+      requestId: input.requestId,
+      error: { message: "The persistence handle names no Antigravity conversation", code: "invalid_persistence" },
+    });
+    return;
+  }
+  try {
+    if (input.type === "session.archive") await archiveConversation(conversationId);
+    else await unarchiveConversation(conversationId);
+  } catch (error) {
+    emit({
+      type: "request.failed",
+      requestId: input.requestId,
+      error: { message: `Could not record the change: ${describe(error)}`, code: "archive_failed" },
+    });
+    return;
+  }
+  emit({ type: "request.completed", requestId: input.requestId });
 }
 
 /**
