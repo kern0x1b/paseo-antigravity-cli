@@ -407,9 +407,60 @@ Both print available models for their respective Google accounts.
 
 ---
 
-## 4. Implementation Status & Conclusion
+## 4. Implementation & Verification: Native Multi-Provider Plugin Approach
 
-- **Finding**: Paseo core changes are required before `~/.paseo/config.json` can support `"extends": "antigravity-cli"`:
-  - `@getpaseo/protocol` currently rejects `extends` pointing to plugin providers.
-  - Paseo daemon does not route extended providers to plugin provider bridges.
-- **Action**: Per user instruction (*"Then implement the plugin changes on a new branch `multi-account` with tests if the design needs no Paseo change; otherwise stop at the document"*), implementation on a branch is suspended pending the Paseo core changes detailed in Section 3.2.
+### 4.1 Discovery: Paseo Supports Multiple Providers per Plugin Natively
+
+While Paseo's `agents.providers` configuration in `~/.paseo/config.json` uses an `extends` mechanism that is restricted to built-in CLI providers, inspection of Paseo's daemon codebase in `/Applications/Paseo.app/Contents/Resources/app.asar` confirms that **Paseo plugins natively support registering multiple providers**:
+
+1. **Plugin Process (`plugin-process.js`, lines 74–91)**:
+   ```javascript
+   const providers = new Map();
+   ...
+   registerProvider(provider) {
+     if (providers.has(provider.id)) {
+       throw new Error(`Provider already registered: ${provider.id}`);
+     }
+     providers.set(provider.id, provider);
+   }
+   ```
+   On initialization, the plugin process collects all registered providers and emits:
+   ```javascript
+   send({ type: "ready", providers: [...providers.values()].map(toMetadata) });
+   ```
+2. **Daemon Host Registry (`plugins/index.js`, lines 182–215)**:
+   The daemon iterates over the returned `metadata` array, checks each provider ID against existing registrations, adds each to `this.providers` map, and routes inbound requests via `connect(pluginId, providerId, request)`.
+3. **Connection Routing (`runtime.js`)**:
+   When Paseo connects to a provider, it passes `providerId`, which the plugin process dispatches to the corresponding registration instance's `connect()` method.
+
+**Result**: No changes to Paseo core or protocol are necessary. The plugin can register as many providers as configured accounts.
+
+---
+
+### 4.2 Implemented Plugin Architecture
+
+The plugin implements multi-account support completely within the plugin:
+
+1. **Configuration Source of Truth (`accounts.json`)**:
+   - Located at `<PASEO_HOME>/plugin-data/antigravity-cli/accounts.json`.
+   - Format:
+     ```json
+     [
+       { "id": "antigravity-cli", "label": "Antigravity", "home": null },
+       { "id": "antigravity-work", "label": "Antigravity Work", "home": "/Users/you/.antigravity-work" }
+     ]
+     ```
+   - **Backward Compatibility**: If `accounts.json` is missing or unreadable, the plugin registers only the default provider (`antigravity-cli`) using the real `HOME` and existing plugin-data paths. Existing sessions are 100% byte-for-byte compatible.
+
+2. **Per-Account Isolation**:
+   - **Process Environment**: `AgyProcess` sets `HOME: resolveAccountHome(session.account)` when spawning `agy`.
+   - **Conversation Index & Discovery**: `listConversations`, `readToolPermission`, `discoverCommands`, and `buildCatalog` resolve under each account's specific `HOME`.
+   - **Plugin Data & Transcripts**: Storage paths (`attachments/`, `transcripts/`, `mcp/`, `schemas/`, `archived.json`) are scoped under `<PASEO_HOME>/plugin-data/<accountId>/`.
+   - **Cross-Account Enforcement**:
+     - `assertConversationAllowed(conversationId, account)` ensures accounts cannot list, import, archive, or open conversations belonging to another account.
+     - `session.archive` verifies ownership before updating `archived.json`.
+
+3. **Dedicated Work Home & Keychain Setup**:
+   - `/Users/you/.antigravity-work` holds non-auth symlinks (`.gitconfig`, `.ssh`, `.npm`, shell configs, `.config`), but **never** `.gemini`.
+   - `/Users/you/.antigravity-work/login.sh`: An idempotent shell script that creates `/Users/you/.antigravity-work/Library/Keychains/login.keychain-db`, records and temporarily adjusts the keychain search list, launches `HOME="$WORK_HOME" agy` to open the browser OAuth sign-in, and guarantees exact restoration of the user's default keychain and search list on exit.
+

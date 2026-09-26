@@ -99,6 +99,61 @@ plan mode itself:
 This is an instruction, not a sandbox: agy has no headless flag that denies edits, so a model that
 ignores the instruction can still write files.
 
+### Multiple accounts
+
+You can run multiple Antigravity accounts side-by-side in Paseo (for example, a personal Google
+account and a work Google account with distinct quota pools) without requiring changes to Paseo.
+The plugin dynamically registers one provider per configured account.
+
+#### 1. Configuration (`accounts.json`)
+
+Configure accounts in `<PASEO_HOME>/plugin-data/antigravity-cli/accounts.json`
+(typically `~/.paseo/plugin-data/antigravity-cli/accounts.json`):
+
+```json
+[
+  {
+    "id": "antigravity-cli",
+    "label": "Antigravity",
+    "home": null
+  },
+  {
+    "id": "antigravity-work",
+    "label": "Antigravity Work",
+    "home": "/Users/username/.antigravity-work"
+  }
+]
+```
+
+- When `accounts.json` is absent, the plugin registers a single provider (`antigravity-cli`) using
+  your default `HOME` — 100% byte-for-byte backward compatible with existing installations.
+- `id`: A valid identifier matching `^[a-z][a-z0-9._-]*$`.
+- `label`: Display name in Paseo's provider list.
+- `home`: `null` to use your system `HOME`, or an absolute path to an isolated home directory.
+
+#### 2. Complete Account Isolation
+
+Everything account-specific follows the account:
+- **CLI Process Environment**: Spawning `agy` sets `HOME` to the configured account directory.
+- **Data & History Isolation**: Conversation index (`conversation_summaries.db`), transcripts,
+  attachments, MCP credentials, and `archived.json` are strictly separated under
+  `<PASEO_HOME>/plugin-data/<accountId>/`.
+- **Cross-Account Protection**: Accounts never list, import, archive, or open each other's
+  conversations. Attempting to open or archive another account's conversation is refused.
+
+#### 3. Setting Up a Work Account Home
+
+Because Antigravity on macOS stores OAuth tokens in the Keychain, a secondary account needs an
+isolated home directory and dedicated keychain to avoid overwriting your primary credentials:
+
+1. Create the work directory (e.g. `~/.antigravity-work/Library/Keychains`).
+2. Symlink developer tools (`.gitconfig`, `.ssh`, shell rc files) from your main home, but **never**
+   symlink `.gemini`.
+3. Run the one-time `login.sh` script to authenticate in your browser with your work Google account.
+   The script creates an isolated keychain at `~/.antigravity-work/Library/Keychains/login.keychain-db`
+   and cleanly restores your default macOS keychain search list upon exit.
+
+
 ### Background commands
 
 When the model starts a long-running command in the background (tests, a build, a dev server), agy
