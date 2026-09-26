@@ -462,5 +462,5 @@ The plugin implements multi-account support completely within the plugin:
 
 3. **Dedicated Work Home & Keychain Setup**:
    - `/Users/you/.antigravity-work` holds non-auth symlinks (`.gitconfig`, `.ssh`, `.npm`, shell configs, `.config`), but **never** `.gemini`.
-   - `/Users/you/.antigravity-work/login.sh`: An idempotent shell script that creates `/Users/you/.antigravity-work/Library/Keychains/login.keychain-db`, records and temporarily adjusts the keychain search list, launches `HOME="$WORK_HOME" agy` to open the browser OAuth sign-in, and guarantees exact restoration of the user's default keychain and search list on exit.
+   - `/Users/you/.antigravity-work/login.sh`: An idempotent shell script that creates `/Users/you/.antigravity-work/Library/Keychains/login.keychain-db`, sets the work home's own keychain search list and default keychain with HOME pointing at the work home (verified: the owner's search list and default keychain stay unchanged, and the script stops if they ever differ), then launches `HOME="$WORK_HOME" agy` for the browser sign-in. The plugin unlocks the work keychain before starting agy, since macOS locks it after a restart.
 

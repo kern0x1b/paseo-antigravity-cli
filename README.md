@@ -151,7 +151,7 @@ isolated home directory and dedicated keychain to avoid overwriting your primary
    symlink `.gemini`.
 3. Run the one-time `login.sh` script to authenticate in your browser with your work Google account.
    The script creates an isolated keychain at `~/.antigravity-work/Library/Keychains/login.keychain-db`
-   and cleanly restores your default macOS keychain search list upon exit.
+   with every keychain command run under HOME set to the work home, so your own keychain search list and default keychain never change - the script checks that and stops if they did. The plugin unlocks that keychain before it starts agy for the account.
 
 
 ### Background commands
