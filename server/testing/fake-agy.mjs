@@ -67,6 +67,10 @@ if (process.env.FAKE_ARGV_LOG) {
   appendFileSync(process.env.FAKE_ARGV_LOG, `${JSON.stringify(argv)}\n`, "utf8");
 }
 
+if (process.env.FAKE_ENV_LOG) {
+  appendFileSync(process.env.FAKE_ENV_LOG, `${JSON.stringify({ argv, home: process.env.HOME })}\n`, "utf8");
+}
+
 if (process.env.FAKE_PID_FILE) {
   writeFileSync(process.env.FAKE_PID_FILE, String(process.pid), "utf8");
 }
