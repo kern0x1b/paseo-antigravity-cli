@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { PROVIDER_ID } from "./constants";
 import { accountPluginDataDir } from "./plugindata";
 import { describe } from "./util";
@@ -98,5 +100,28 @@ export function loadAccounts(customPath?: string): AccountConfig[] {
   } catch (error) {
     console.error(`[antigravity] failed to read accounts from ${filePath}: ${describe(error)}`);
     return [DEFAULT_ACCOUNT];
+  }
+}
+
+type RunFile = (file: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => unknown;
+
+/**
+ * An account with its own home keeps its credentials in its own keychain there, created by that
+ * account's login script with an empty password. macOS locks it again after a restart, and agy
+ * cannot read its token from a locked keychain, so it is unlocked before agy starts. The owner's
+ * own keychains are never touched: `security` runs with HOME pointing at the account.
+ */
+export function unlockAccountKeychain(
+  accountHome: string | null,
+  run: RunFile = (file, args, options) => execFileSync(file, args, { ...options, stdio: "ignore", timeout: 5000 }),
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (!accountHome || platform !== "darwin") return;
+  const keychain = join(accountHome, "Library", "Keychains", "login.keychain-db");
+  if (!existsSync(keychain)) return;
+  try {
+    run("/usr/bin/security", ["unlock-keychain", "-p", "", keychain], { env: { ...process.env, HOME: accountHome } });
+  } catch (error) {
+    console.error(`[antigravity] could not unlock the keychain of ${accountHome}: ${describe(error)}`);
   }
 }

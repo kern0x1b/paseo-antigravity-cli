@@ -1,3 +1,4 @@
+import { unlockAccountKeychain } from "./accounts";
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -133,6 +134,7 @@ async function loadModels(binary?: string, accountHome: string = homedir()): Pro
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.models;
 
   let models: readonly ProviderModel[] = [];
+  if (accountHome !== homedir()) unlockAccountKeychain(accountHome);
   try {
     const { stdout } = await execFileAsync(resolveAgyBinary(binary), ["models"], {
       timeout: MODELS_TIMEOUT_MS,

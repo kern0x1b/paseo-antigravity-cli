@@ -3,6 +3,7 @@
  */
 
 import type { ProviderError } from "@getpaseo/plugin/server/provider";
+import { unlockAccountKeychain } from "./accounts";
 import { AgyProcess } from "./agy";
 import { handleDetachedExit } from "./background";
 import { resolveThinking } from "./catalog";
@@ -27,6 +28,7 @@ export function ensureProcess(session: Session, emit: Emit): AgyProcess {
   }
 
   const homeOverride = session.account.home;
+  unlockAccountKeychain(homeOverride);
   const env = {
     ...session.config.env,
     ...(homeOverride ? { HOME: homeOverride } : {}),

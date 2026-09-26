@@ -7,6 +7,7 @@ import {
   loadAccounts,
   parseAccounts,
   resolveAccountHome,
+  unlockAccountKeychain,
 } from "./accounts";
 import { accountPluginDataDir, pluginDataDir } from "./plugindata";
 
@@ -107,5 +108,48 @@ describe("accountPluginDataDir", () => {
     expect(accountPluginDataDir({ id: "antigravity-work" }, "archived.json")).toBe(
       join(home, "plugin-data", "antigravity-work", "archived.json"),
     );
+  });
+});
+
+describe("unlockAccountKeychain", () => {
+  it("unlocks the account's own keychain with HOME pointing at the account", () => {
+    const accountHome = join(home, "work");
+    const keychain = join(accountHome, "Library", "Keychains", "login.keychain-db");
+    mkdirSync(join(accountHome, "Library", "Keychains"), { recursive: true });
+    writeFileSync(keychain, "");
+    const calls: { file: string; args: string[]; env?: NodeJS.ProcessEnv }[] = [];
+
+    unlockAccountKeychain(accountHome, (file, args, options) => {
+      calls.push({ file, args, env: options.env });
+    }, "darwin");
+
+    expect(calls).toEqual([
+      { file: "/usr/bin/security", args: ["unlock-keychain", "-p", "", keychain], env: expect.objectContaining({ HOME: accountHome }) },
+    ]);
+  });
+
+  it("does nothing without a keychain in the account home, off macOS, or for the default account", () => {
+    const calls: string[][] = [];
+    const run = (_file: string, args: string[]) => {
+      calls.push(args);
+    };
+    unlockAccountKeychain(join(home, "missing"), run, "darwin");
+    const accountHome = join(home, "work");
+    mkdirSync(join(accountHome, "Library", "Keychains"), { recursive: true });
+    writeFileSync(join(accountHome, "Library", "Keychains", "login.keychain-db"), "");
+    unlockAccountKeychain(accountHome, run, "linux");
+    unlockAccountKeychain(null, run, "darwin");
+    expect(calls).toEqual([]);
+  });
+
+  it("does not throw when unlocking fails", () => {
+    const accountHome = join(home, "work");
+    mkdirSync(join(accountHome, "Library", "Keychains"), { recursive: true });
+    writeFileSync(join(accountHome, "Library", "Keychains", "login.keychain-db"), "");
+    expect(() =>
+      unlockAccountKeychain(accountHome, () => {
+        throw new Error("locked");
+      }, "darwin"),
+    ).not.toThrow();
   });
 });
