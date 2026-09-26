@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
-import { pluginDataDir, safePathSegment } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId, safePathSegment } from "./plugindata";
 
 /**
  * Remembers the timeline rows a conversation produced so `session.open` with `history: "replay"`
@@ -31,12 +31,12 @@ export class TranscriptStore {
   /** Whether rows older than the ones held were dropped, now or in an earlier run. */
   truncated = false;
 
-  constructor(conversationId: string) {
-    this.path = transcriptPath(conversationId);
+  constructor(conversationId: string, account?: AccountOrId) {
+    this.path = transcriptPath(conversationId, account);
   }
 
-  static async load(conversationId: string): Promise<TranscriptStore> {
-    const store = new TranscriptStore(conversationId);
+  static async load(conversationId: string, account?: AccountOrId): Promise<TranscriptStore> {
+    const store = new TranscriptStore(conversationId, account);
     try {
       const raw = await readFile(store.path, "utf8");
       for (const line of raw.split("\n")) {
@@ -113,13 +113,13 @@ export class TranscriptStore {
   }
 }
 
-function transcriptPath(conversationId: string): string {
-  return pluginDataDir("transcripts", `${safePathSegment(conversationId)}.jsonl`);
+export function transcriptPath(conversationId: string, account?: AccountOrId): string {
+  return accountPluginDataDir(account, "transcripts", `${safePathSegment(conversationId)}.jsonl`);
 }
 
 /** Whether this plugin ever stored a timeline for the conversation. */
-export function transcriptExists(conversationId: string): boolean {
-  return existsSync(transcriptPath(conversationId));
+export function transcriptExists(conversationId: string, account?: AccountOrId): boolean {
+  return existsSync(transcriptPath(conversationId, account));
 }
 
 function describe(error: unknown): string {

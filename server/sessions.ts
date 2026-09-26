@@ -3,7 +3,9 @@ import { join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import type { ProviderSessionSummary } from "@getpaseo/plugin/server/provider";
-import { pluginDataDir } from "./plugindata";
+import { type AccountConfig, loadAccounts, resolveAccountHome } from "./accounts";
+import { accountPluginDataDir } from "./plugindata";
+import { transcriptExists } from "./transcript";
 
 const DEFAULT_LIMIT = 50;
 
@@ -34,6 +36,7 @@ export interface ConversationQuery {
    * conversations when the newest ones are excluded.
    */
   exclude?: (conversationId: string) => boolean;
+  account?: AccountConfig;
 }
 
 /**
@@ -42,7 +45,9 @@ export interface ConversationQuery {
  * schema, locked or corrupt pages - yields an empty list plus a log line, never a thrown error.
  */
 export function listConversations(options: ConversationQuery): ProviderSessionSummary[] {
-  const rows = readConversations();
+  const account = options.account;
+  const home = resolveAccountHome(account);
+  const rows = readConversations(home);
   const wantedCwd = options.cwd === undefined ? undefined : stripTrailingSlash(options.cwd);
   const wantedText = options.query?.trim().toLowerCase();
   const requested = options.limit ?? DEFAULT_LIMIT;
@@ -51,7 +56,7 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
   const summaries: ProviderSessionSummary[] = [];
   for (const row of rows) {
     if (options.exclude?.(row.conversation_id)) continue;
-    const workspace = firstWorkspacePath(row.workspace_uris);
+    const workspace = firstWorkspacePath(row.workspace_uris, account);
     if (
       wantedCwd !== undefined &&
       (workspace === null || stripTrailingSlash(workspace) !== wantedCwd)
@@ -80,8 +85,8 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
   return summaries;
 }
 
-function readConversations(): ConversationRow[] {
-  const path = join(homedir(), ".gemini", "antigravity-cli", "conversation_summaries.db");
+function readConversations(accountHome: string = homedir()): ConversationRow[] {
+  const path = join(accountHome, ".gemini", "antigravity-cli", "conversation_summaries.db");
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(path, { readOnly: true });
@@ -95,6 +100,63 @@ function readConversations(): ConversationRow[] {
     } catch {
       // A database that never opened has nothing to close.
     }
+  }
+}
+
+export function hasConversation(conversationId: string, accountHome: string = homedir()): boolean {
+  const path = join(accountHome, ".gemini", "antigravity-cli", "conversation_summaries.db");
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+    const stmt = db.prepare("select 1 from conversation_summaries where conversation_id = ?");
+    const row = stmt.get(conversationId);
+    return row !== undefined;
+  } catch {
+    return false;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // A database that never opened has nothing to close.
+    }
+  }
+}
+
+export function conversationBelongsToAccount(
+  conversationId: string,
+  account: AccountConfig,
+): boolean {
+  if (transcriptExists(conversationId, account)) return true;
+  if (hasConversation(conversationId, resolveAccountHome(account))) return true;
+  return false;
+}
+
+export function assertConversationAllowed(
+  conversationId: string,
+  account: AccountConfig,
+  allAccounts: AccountConfig[] = loadAccounts(),
+): void {
+  for (const other of allAccounts) {
+    if (other.id === account.id) continue;
+    if (conversationBelongsToAccount(conversationId, other)) {
+      throw new Error(`Conversation ${conversationId} belongs to account "${other.id}", not "${account.id}"`);
+    }
+  }
+  if (allAccounts.length > 1 && !conversationBelongsToAccount(conversationId, account)) {
+    throw new Error(`Conversation ${conversationId} does not belong to account "${account.id}"`);
+  }
+}
+
+export function isConversationAllowed(
+  conversationId: string,
+  account: AccountConfig,
+  allAccounts: AccountConfig[] = loadAccounts(),
+): boolean {
+  try {
+    assertConversationAllowed(conversationId, account, allAccounts);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -115,7 +177,7 @@ function toRow(value: Record<string, unknown>): ConversationRow {
  * the plugin passed, sorted, so the plugin's own folders (attachments, skills) can come before the
  * workspace; they are never the conversation's workspace and are skipped.
  */
-function firstWorkspacePath(workspaceUris: string): string | null {
+function firstWorkspacePath(workspaceUris: string, account?: AccountConfig): string | null {
   if (workspaceUris.trim().length === 0) return null;
   let decoded: unknown;
   try {
@@ -124,7 +186,8 @@ function firstWorkspacePath(workspaceUris: string): string | null {
     return null;
   }
   if (!Array.isArray(decoded)) return null;
-  const own = stripTrailingSlash(pluginDataDir());
+  const own = stripTrailingSlash(accountPluginDataDir(account));
+  const defaultOwn = stripTrailingSlash(accountPluginDataDir(null));
   for (const uri of decoded) {
     if (typeof uri !== "string") continue;
     let path: string;
@@ -135,6 +198,7 @@ function firstWorkspacePath(workspaceUris: string): string | null {
     }
     const bare = stripTrailingSlash(path);
     if (bare === own || bare.startsWith(`${own}${sep}`)) continue;
+    if (bare === defaultOwn || bare.startsWith(`${defaultOwn}${sep}`)) continue;
     return path;
   }
   return null;

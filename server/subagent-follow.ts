@@ -235,7 +235,7 @@ async function followChildTranscript(
   let store: TranscriptStore | null = null;
   if (session.persist) {
     try {
-      store = await TranscriptStore.load(childConversationId);
+      store = await TranscriptStore.load(childConversationId, session.account);
     } catch (error) {
       console.error(
         `[antigravity] could not read the transcript of ${childConversationId}: ${describe(error)}`,

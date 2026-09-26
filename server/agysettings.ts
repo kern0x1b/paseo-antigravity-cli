@@ -9,8 +9,8 @@ import { join } from "node:path";
  * any credential. A missing, unreadable, or malformed file is not an error: the value is simply
  * unknown and Antigravity's own default applies.
  */
-export function readToolPermission(): string | null {
-  const path = join(homedir(), ".gemini", "antigravity-cli", "settings.json");
+export function readToolPermission(accountHome: string = homedir()): string | null {
+  const path = join(accountHome, ".gemini", "antigravity-cli", "settings.json");
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;

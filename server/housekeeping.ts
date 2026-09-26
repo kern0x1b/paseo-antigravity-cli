@@ -1,6 +1,6 @@
 import { readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { pluginDataDir, safePathSegment } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId, safePathSegment } from "./plugindata";
 
 /**
  * Removes what sessions that will never come back left in the plugin's data directory: the
@@ -15,6 +15,7 @@ import { pluginDataDir, safePathSegment } from "./plugindata";
 export async function sweepPluginData(options: {
   live: ReadonlySet<string>;
   retentionMs: number;
+  account?: AccountOrId;
 }): Promise<void> {
   const live = new Set([...options.live].map((id) => safePathSegment(id)));
   const oldest = Date.now() - options.retentionMs;
@@ -23,17 +24,17 @@ export async function sweepPluginData(options: {
     ["attachments", ""],
     ["schemas", ".json"],
   ] as const) {
-    for (const name of await names(pluginDataDir(folder))) {
+    for (const name of await names(accountPluginDataDir(options.account, folder))) {
       const session = suffix === "" ? name : name.endsWith(suffix) ? name.slice(0, -suffix.length) : name;
       if (live.has(session)) continue;
-      const path = join(pluginDataDir(folder), name);
+      const path = join(accountPluginDataDir(options.account, folder), name);
       if (!(await olderThan(path, oldest))) continue;
       await remove(path);
     }
   }
 
-  for (const name of await names(pluginDataDir("transcripts"))) {
-    const path = join(pluginDataDir("transcripts"), name);
+  for (const name of await names(accountPluginDataDir(options.account, "transcripts"))) {
+    const path = join(accountPluginDataDir(options.account, "transcripts"), name);
     const info = await stat(path).catch(() => null);
     if (info?.isFile() && info.size === 0) await remove(path);
   }

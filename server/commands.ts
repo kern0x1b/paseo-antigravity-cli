@@ -138,18 +138,18 @@ export interface DiscoveredCommands {
 }
 
 /** Every command the composer can offer, with the ones the CLI does not expand marked as ours. */
-export async function discoverCommands(cwd: string): Promise<DiscoveredCommands> {
+export async function discoverCommands(cwd: string, accountHome: string = homedir()): Promise<DiscoveredCommands> {
   const commands = new Map<string, AgyCommand>();
   for (const command of SYSTEM_COMMANDS) commands.set(command.name, command);
   for (const root of WORKSPACE_ROOTS) await collectSkills(join(cwd, root, "skills"), commands);
   // A global skill is addressed by its own name and outranks the CLI's own skills, which is why
   // these are read before the plugins and the built-in set.
-  for (const root of GLOBAL_ROOTS) await collectSkills(join(homedir(), root), commands);
+  for (const root of GLOBAL_ROOTS) await collectSkills(join(accountHome, root), commands);
   // Verified 2026-09-23: `/firebase:firebase-basics` expanded, so a plugin's skills are addressed
   // by the plugin's directory name and the skill's own name. A plugin that keeps its one skill
   // directly in `skills/` is addressed with a `..` placeholder instead of a directory:
   // `/android-cli-plugin:..:android-cli` expanded, while `/android-cli-plugin:android-cli` did not.
-  const plugins = join(homedir(), ".gemini", "config", "plugins");
+  const plugins = join(accountHome, ".gemini", "config", "plugins");
   for (const plugin of await subdirectories(plugins)) {
     const prefix = `${basename(plugin)}:`;
     const root = join(plugin, "skills");
@@ -160,12 +160,12 @@ export async function discoverCommands(cwd: string): Promise<DiscoveredCommands>
     await collectSkills(root, commands, prefix);
   }
   // Where the CLI unpacks the skills it ships with, one directory per skill.
-  const builtin = join(homedir(), ".gemini", "antigravity-cli", "builtin", "skills");
+  const builtin = join(accountHome, ".gemini", "antigravity-cli", "builtin", "skills");
   await collectSkills(builtin, commands);
   // Last, because a name the CLI expands itself is the one the user gets: a skill here whose name
   // is taken is left to the CLI's own copy rather than offered twice with different behaviour.
   const expanded = new Map<string, ExpandedSkill>();
-  for (const dir of await subdirectories(join(homedir(), SHARED_SKILL_ROOT))) {
+  for (const dir of await subdirectories(join(accountHome, SHARED_SKILL_ROOT))) {
     const path = join(dir, "SKILL.md");
     const skill = await readSkill(path);
     if (skill === null || commands.has(skill.name)) continue;

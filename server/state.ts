@@ -12,6 +12,7 @@ import type {
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
+import type { AccountConfig } from "./accounts";
 import type { AgyProcess } from "./agy";
 import type { FileSnapshot } from "./edits";
 import type { JsonValue } from "./json";
@@ -29,6 +30,7 @@ import type { TranscriptStore } from "./transcript";
 export const liveSessions = new Set<string>();
 
 export interface Session {
+  readonly account: AccountConfig;
   readonly sessionId: string;
   readonly timing: Timing;
   readonly config: ProviderSessionConfig;
@@ -312,6 +314,7 @@ export interface TurnFailure {
 }
 
 export interface ConnectionState {
+  readonly account: AccountConfig;
   capabilities: readonly ProviderCapability[];
   timing: Timing;
   sessions: Map<string, Session>;

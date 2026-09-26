@@ -4,6 +4,7 @@
  */
 
 import type { ProviderError } from "@getpaseo/plugin/server/provider";
+import { resolveAccountHome } from "./accounts";
 import { AgyProcess } from "./agy";
 import { conversationTranscriptPath, modelActed, renderBackfill, stepsPast } from "./backfill";
 import { lastAssistantText, offerPlan } from "./plan";
@@ -65,9 +66,12 @@ export function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit
       `[antigravity] a tool has been running for ${delay / 1000}s; following the conversation transcript`,
     );
     // Only this turn's steps are needed, and the file holds every turn of the conversation.
-    const reader = new TranscriptReader(conversationTranscriptPath(conversationId), {
-      fromStep: Math.max(turn.firstStep, 0),
-    });
+    const reader = new TranscriptReader(
+      conversationTranscriptPath(conversationId, resolveAccountHome(session.account)),
+      {
+        fromStep: Math.max(turn.firstStep, 0),
+      },
+    );
     turn.backfill = new TranscriptTailer(
       reader,
       {
@@ -265,9 +269,12 @@ function detachProcess(session: Session, emit: Emit, process: AgyProcess): void 
   if (conversationId === null || session.closing) return;
   // What the model does from here on is all that is read: everything up to the settled step is
   // already published.
-  const reader = new TranscriptReader(conversationTranscriptPath(conversationId), {
-    fromStep: session.settledStep + 1,
-  });
+  const reader = new TranscriptReader(
+    conversationTranscriptPath(conversationId, resolveAccountHome(session.account)),
+    {
+      fromStep: session.settledStep + 1,
+    },
+  );
   const continuation: Continuation = {
     tailer: new TranscriptTailer(
       reader,

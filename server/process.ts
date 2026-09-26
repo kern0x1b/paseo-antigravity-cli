@@ -26,10 +26,16 @@ export function ensureProcess(session: Session, emit: Emit): AgyProcess {
     runInBackground("stop the previous CLI", current.dispose());
   }
 
+  const homeOverride = session.account.home;
+  const env = {
+    ...session.config.env,
+    ...(homeOverride ? { HOME: homeOverride } : {}),
+  };
+
   const process = new AgyProcess(
     {
       cwd: session.config.cwd,
-      env: session.config.env,
+      env,
       model: resolveThinking(session.selection.model, session.selection.thinkingOption).slug,
       mode: session.selection.mode,
       conversationId: session.conversationId ?? undefined,
@@ -40,7 +46,7 @@ export function ensureProcess(session: Session, emit: Emit): AgyProcess {
       allowSlashCommands: session.launchPending.commands,
       attachmentDir: session.attachmentsDir ?? undefined,
       skillDir: session.launchPending.skillDir ?? undefined,
-      mcpDir: session.mcp === "applied" ? mcpSessionDir(session.sessionId) : undefined,
+      mcpDir: session.mcp === "applied" ? mcpSessionDir(session.sessionId, session.account) : undefined,
       extraArgs: session.extraArgs,
       binary: session.agyPath,
       terminateGraceMs: session.timing.terminateGraceMs,

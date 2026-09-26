@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
+import { homedir } from "node:os";
 import { promisify } from "node:util";
 import type {
   ProviderCatalog,
@@ -65,14 +66,14 @@ const FALLBACK_MODELS: readonly ProviderModel[] = groupModels(
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MODELS_TIMEOUT_MS = 20_000;
 
-let cache: { key: string; at: number; models: readonly ProviderModel[] } | null = null;
+const cache = new Map<string, { at: number; models: readonly ProviderModel[] }>();
 
 /**
  * Identity of the CLI whose model list is cached. A different binary or a rebuilt one can report a
  * different list, so both the resolved path and its modification time belong in the key that Paseo
  * uses to decide whether to rediscover — and in the key this module caches under.
  */
-export function catalogCacheKey(binary?: string): string {
+export function catalogCacheKey(binary?: string, accountHome: string = homedir()): string {
   const resolved = resolveAgyBinary(binary);
   let mtime = "unknown";
   try {
@@ -80,24 +81,42 @@ export function catalogCacheKey(binary?: string): string {
   } catch {
     // A PATH-resolved or deleted binary has no build identity; the path still keys the cache.
   }
-  return `${resolved}|${mtime}|${process.env.PASEO_ANTIGRAVITY_BIN ?? ""}`;
+  return `${resolved}|${mtime}|${accountHome}|${process.env.PASEO_ANTIGRAVITY_BIN ?? ""}`;
 }
 
 /** Drops the discovered list so the next catalog request runs `agy models` again. */
-export function invalidateCatalogCache(): void {
-  cache = null;
+export function invalidateCatalogCache(binary?: string, accountHome?: string): void {
+  if (binary !== undefined && accountHome !== undefined) {
+    cache.delete(catalogCacheKey(binary, accountHome));
+    return;
+  }
+  if (binary === undefined && accountHome === undefined) {
+    cache.clear();
+    return;
+  }
+  for (const key of cache.keys()) {
+    const parts = key.split("|");
+    const keyResolved = parts[0];
+    const keyAccountHome = parts[2];
+    const matchesHome = accountHome === undefined || keyAccountHome === accountHome;
+    const matchesBinary = binary === undefined || keyResolved === resolveAgyBinary(binary);
+    if (matchesHome && matchesBinary) {
+      cache.delete(key);
+    }
+  }
 }
 
 /**
  * Synchronous view of the last discovered list, for `session.config` where an async lookup would
  * stall the provider. The catalog request path is what refreshes the cache.
  */
-export function currentModels(): readonly ProviderModel[] {
-  return cache?.models ?? FALLBACK_MODELS;
+export function currentModels(accountHome: string = homedir()): readonly ProviderModel[] {
+  const key = catalogCacheKey(undefined, accountHome);
+  return cache.get(key)?.models ?? FALLBACK_MODELS;
 }
 
-export async function buildCatalog(binary?: string): Promise<ProviderCatalog> {
-  const models = await loadModels(binary);
+export async function buildCatalog(binary?: string, accountHome: string = homedir()): Promise<ProviderCatalog> {
+  const models = await loadModels(binary, accountHome);
   return {
     models,
     modes: MODES,
@@ -108,15 +127,17 @@ export async function buildCatalog(binary?: string): Promise<ProviderCatalog> {
   };
 }
 
-async function loadModels(binary?: string): Promise<readonly ProviderModel[]> {
-  const key = catalogCacheKey(binary);
-  if (cache && cache.key === key && Date.now() - cache.at < CACHE_TTL_MS) return cache.models;
+async function loadModels(binary?: string, accountHome: string = homedir()): Promise<readonly ProviderModel[]> {
+  const key = catalogCacheKey(binary, accountHome);
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.models;
 
   let models: readonly ProviderModel[] = [];
   try {
     const { stdout } = await execFileAsync(resolveAgyBinary(binary), ["models"], {
       timeout: MODELS_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, HOME: accountHome },
     });
     models = groupModels(parseModels(stdout));
   } catch (error) {
@@ -124,7 +145,7 @@ async function loadModels(binary?: string): Promise<readonly ProviderModel[]> {
   }
 
   const resolved = models.length > 0 ? models : FALLBACK_MODELS;
-  cache = { key, at: Date.now(), models: resolved };
+  cache.set(key, { at: Date.now(), models: resolved });
   return resolved;
 }
 

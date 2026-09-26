@@ -16,7 +16,7 @@ import {
   writeSessionMcpConfig,
 } from "./mcp";
 import { persistenceFor, readConversationId } from "./persistence";
-import { pluginDataDir, safePathSegment } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId, pluginDataDir, safePathSegment } from "./plugindata";
 import { emitNotice } from "./publish";
 import { replayItem } from "./replay";
 import { checkAddDirs, configState, isSettingOn, readProviderOptions } from "./settings";
@@ -29,11 +29,16 @@ import {
 } from "./state";
 import { MAX_ITEMS, transcriptExists, TranscriptStore } from "./transcript";
 import { attempt, describe } from "./util";
+import { resolveAccountHome, type AccountConfig } from "./accounts";
+import { assertConversationAllowed } from "./sessions";
 
-function insidePluginData(cwd: string): boolean {
-  const own = resolve(pluginDataDir());
+function insidePluginData(cwd: string, account?: AccountConfig): boolean {
   const path = resolve(cwd);
-  return path === own || path.startsWith(`${own}${sep}`);
+  const dirs = [resolve(pluginDataDir())];
+  if (account) {
+    dirs.push(resolve(accountPluginDataDir(account)));
+  }
+  return dirs.some((dir) => path === dir || path.startsWith(`${dir}${sep}`));
 }
 
 export async function openSession(
@@ -42,13 +47,16 @@ export async function openSession(
   emit: Emit,
 ): Promise<void> {
   const config = input.config;
-  if (insidePluginData(config.cwd)) {
+  if (insidePluginData(config.cwd, state.account)) {
     throw new Error(`${config.cwd} is where this plugin keeps its own files, not a workspace`);
   }
   const conversationId = readConversationId(input.persistence);
+  if (conversationId !== null) {
+    assertConversationAllowed(conversationId, state.account);
+  }
   const options = readProviderOptions(config);
   const persist = config.persist !== false;
-  const attachmentsDir = await prepareAttachmentsDir(input.sessionId);
+  const attachmentsDir = await prepareAttachmentsDir(input.sessionId, state.account);
   const addDirs = await checkAddDirs(options.addDirs);
 
   // Computed before this session joins the map: a conversation with no timeline of this plugin's
@@ -56,12 +64,13 @@ export async function openSession(
   // inside its write debounce, so those count as stored too.
   const knownHistory =
     conversationId !== null &&
-    (transcriptExists(conversationId) ||
+    (transcriptExists(conversationId, state.account) ||
       [...state.sessions.values()].some(
         (other) => other.conversationId === conversationId && other.transcript !== null,
       ));
 
   const session: Session = {
+    account: state.account,
     sessionId: input.sessionId,
     timing: state.timing,
     config,
@@ -77,12 +86,12 @@ export async function openSession(
     conversationId,
     persist,
     transcript:
-      persist && conversationId !== null ? await TranscriptStore.load(conversationId) : null,
+      persist && conversationId !== null ? await TranscriptStore.load(conversationId, state.account) : null,
     unpersisted: [],
     process: null,
     needsRestart: false,
     // One file per session: rewritten before each schema turn, removed on close.
-    schemaPath: pluginDataDir("schemas", `${safePathSegment(input.sessionId)}.json`),
+    schemaPath: accountPluginDataDir(state.account, "schemas", `${safePathSegment(input.sessionId)}.json`),
     launchPending: { schema: false, commands: false, skillDir: null },
     launchActive: { schema: false, commands: false, skillDir: null },
     attachmentsDir,
@@ -128,7 +137,7 @@ export async function openSession(
     // `session.ready` reaches it — including for the throwaway probe a draft opens. Which of these
     // names this plugin expands itself is kept: a later prompt re-reads the roots, and this is what
     // separates a skill that has since disappeared from a name the CLI expands on its own.
-    const discovered = await discoverCommands(config.cwd);
+    const discovered = await discoverCommands(config.cwd, resolveAccountHome(state.account));
     session.publishedSkills = new Set(discovered.expanded.keys());
     emit({
       type: "session.commands",
@@ -139,7 +148,7 @@ export async function openSession(
     await syncSessionMcp(session, emit);
     // Leftovers from a process that died without releasing its folders, and this is where the set
     // of live sessions is known.
-    await sweepSessionMcpConfigs(liveSessions);
+    await sweepSessionMcpConfigs(liveSessions, state.account);
     if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
       emitNotice(
         session,
@@ -147,7 +156,7 @@ export async function openSession(
         "mcp-unsupported",
         "warning",
         "MCP servers are not applied",
-        `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a directory it was given. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpSessionConfigPath(input.sessionId)}, a folder private to this session, or add them yourself with \`agy mcp add\`.`,
+        `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a directory it was given. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpSessionConfigPath(input.sessionId, state.account)}, a folder private to this session, or add them yourself with \`agy mcp add\`.`,
       );
     }
     if (addDirs.dropped.length > 0) {
@@ -228,8 +237,8 @@ async function abandonSession(state: ConnectionState, session: Session): Promise
   session.detached = null;
   await Promise.allSettled(processes.map((process) => process.dispose()));
   await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
-  await attempt("clear the attachments", () => clearAttachments(session.sessionId));
-  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId));
+  await attempt("clear the attachments", () => clearAttachments(session.sessionId, session.account));
+  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId, session.account));
 }
 
 /**
@@ -237,8 +246,8 @@ async function abandonSession(state: ConnectionState, session: Session): Promise
  * that cannot create it still opens: plain turns run without the extra directory, and an image
  * prompt fails with `attachment_failed`.
  */
-async function prepareAttachmentsDir(sessionId: string): Promise<string | null> {
-  const dir = attachmentsDir(sessionId);
+async function prepareAttachmentsDir(sessionId: string, account?: AccountOrId): Promise<string | null> {
+  const dir = attachmentsDir(sessionId, account);
   try {
     await mkdir(dir, { recursive: true });
     return dir;
@@ -260,12 +269,12 @@ export async function syncSessionMcp(session: Session, emit: Emit): Promise<void
   if (!isSettingOn(session.settings.shareMcp) || Object.keys(servers).length === 0) {
     if (session.mcp === "released") return;
     session.mcp = "released";
-    await removeSessionMcpConfig(session.sessionId);
+    await removeSessionMcpConfig(session.sessionId, session.account);
     return;
   }
   if (session.mcp !== "released") return;
 
-  const result = await writeSessionMcpConfig(session.sessionId, servers);
+  const result = await writeSessionMcpConfig(session.sessionId, servers, session.account);
   if (result.status === "failed") {
     session.mcp = "error";
     emitNotice(
@@ -320,8 +329,8 @@ export async function closeSession(
   for (const follow of children) await attempt("write a subagent's timeline", () => follow.store?.flush());
   await Promise.allSettled([process?.dispose(), detached?.dispose()]);
   await attempt("remove the output schema", () => rm(session.schemaPath, { force: true }));
-  await attempt("clear the attachments", () => clearAttachments(session.sessionId));
-  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId));
+  await attempt("clear the attachments", () => clearAttachments(session.sessionId, session.account));
+  await attempt("release the MCP entries", () => removeSessionMcpConfig(session.sessionId, session.account));
 
   // Every child that settled already closed its own session and left this set, so what is left is
   // a child that was still running: closing it silently would tell the host it completed.

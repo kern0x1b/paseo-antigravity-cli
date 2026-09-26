@@ -1,6 +1,6 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { pluginDataDir, safePathSegment } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId, safePathSegment } from "./plugindata";
 
 /**
  * Antigravity's stream input accepts text blocks only (`stream input content block type "image"
@@ -8,8 +8,8 @@ import { pluginDataDir, safePathSegment } from "./plugindata";
  * told to open with `view_file`. The folder is passed as an extra `--add-dir` on every launch and
  * deleted when the session closes; nothing is ever written into the user's workspace.
  */
-export function attachmentsDir(sessionId: string): string {
-  return pluginDataDir("attachments", safePathSegment(sessionId));
+export function attachmentsDir(sessionId: string, account?: AccountOrId): string {
+  return accountPluginDataDir(account, "attachments", safePathSegment(sessionId));
 }
 
 const EXTENSIONS: Record<string, string> = {
@@ -32,18 +32,19 @@ export async function writeAttachment(
   data: string,
   mimeType: string,
   maxBytes = MAX_ATTACHMENT_BYTES,
+  account?: AccountOrId,
 ): Promise<string> {
   const bytes = Buffer.from(data, "base64");
   if (bytes.length > maxBytes) {
     throw new Error(`the image is ${bytes.length} bytes, larger than the ${maxBytes} this plugin will attach`);
   }
-  const dir = attachmentsDir(sessionId);
+  const dir = attachmentsDir(sessionId, account);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${index}.${EXTENSIONS[mimeType] ?? "bin"}`);
   await writeFile(path, bytes, { mode: 0o600 });
   return path;
 }
 
-export async function clearAttachments(sessionId: string): Promise<void> {
-  await rm(attachmentsDir(sessionId), { recursive: true, force: true });
+export async function clearAttachments(sessionId: string, account?: AccountOrId): Promise<void> {
+  await rm(attachmentsDir(sessionId, account), { recursive: true, force: true });
 }

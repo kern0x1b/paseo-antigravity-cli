@@ -15,16 +15,18 @@ import { currentModels, DEFAULT_MODE_ID, MODES, resolveThinking } from "./catalo
 import type { JsonValue } from "./json";
 import { mcpSessionConfigPath } from "./mcp";
 import type { Session } from "./state";
+import { resolveAccountHome } from "./accounts";
 
 export function configState(session: Session): ProviderConfigState {
   // The tier belongs to the selected model, so the composer's axis is that model's own tiers and
   // the committed option is the one the next launch will actually pass.
   const thinking = resolveThinking(session.selection.model, session.selection.thinkingOption);
+  const home = resolveAccountHome(session.account);
   return {
     model: session.selection.model,
     mode: session.selection.mode ?? DEFAULT_MODE_ID,
     thinkingOption: thinking.option,
-    models: currentModels(),
+    models: currentModels(home),
     modes: MODES,
     thinkingOptions: thinking.options,
     settings: buildSettings(session),
@@ -35,7 +37,8 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
   const policy = approvalPolicy(session);
   // Antigravity decides through its own setting unless the user overrides it here, so the row
   // names that value rather than guessing at what a headless run will do.
-  const permission = readToolPermission() ?? "unknown";
+  const home = resolveAccountHome(session.account);
+  const permission = readToolPermission(home) ?? "unknown";
   return [
     {
       type: "select",

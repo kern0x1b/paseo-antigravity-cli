@@ -18,15 +18,20 @@ import { closeSession, openSession } from "./lifecycle";
 import { removeSessionMcpConfig } from "./mcp";
 import { readConversationId } from "./persistence";
 import { respondToPermission } from "./plan";
-import { listConversations } from "./sessions";
+import { isConversationAllowed, listConversations } from "./sessions";
 import { type ConnectionState, type Emit, liveSessions } from "./state";
 import type { Timing } from "./timing";
 import { configureSession, interruptSession, promptSession } from "./turns";
 import { describe } from "./util";
+import { type AccountConfig, DEFAULT_ACCOUNT, resolveAccountHome } from "./accounts";
 
-export function createConnection(capabilities: readonly ProviderCapability[], timing: Timing): ProviderConnection {
+export function createConnection(
+  capabilities: readonly ProviderCapability[],
+  timing: Timing,
+  account: AccountConfig = DEFAULT_ACCOUNT,
+): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
-  const state: ConnectionState = { capabilities, timing, sessions: new Map() };
+  const state: ConnectionState = { account, capabilities, timing, sessions: new Map() };
   let closed = false;
 
   const emit: Emit = (event) => {
@@ -83,7 +88,7 @@ export function createConnection(capabilities: readonly ProviderCapability[], ti
       await Promise.allSettled(flushing.map((flush) => flush()));
       await Promise.allSettled(running.map((process) => process.dispose()));
       // A close without a session.close: entries this connection injected still belong to it.
-      await Promise.allSettled(sessionIds.map((id) => removeSessionMcpConfig(id)));
+      await Promise.allSettled(sessionIds.map((id) => removeSessionMcpConfig(id, state.account)));
     },
   };
 }
@@ -109,16 +114,21 @@ function validateAdmission(input: ProviderInput, state: ConnectionState): void {
 async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit): Promise<void> {
   switch (input.type) {
     case "catalog":
-      emit({ type: "catalog", requestId: input.requestId, catalog: await buildCatalog() });
+      emit({
+        type: "catalog",
+        requestId: input.requestId,
+        catalog: await buildCatalog(undefined, resolveAccountHome(state.account)),
+      });
       return;
     case "sessions": {
       // A conversation a session is running, or one that was archived, is not one to import.
       const running = runningConversations(state);
-      const archived = await archivedConversations();
+      const archived = await archivedConversations(state.account);
       emit({
         type: "sessions",
         requestId: input.requestId,
         sessions: listConversations({
+          account: state.account,
           cwd: input.cwd,
           query: input.query,
           limit: input.limit,
@@ -129,7 +139,7 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
     }
     case "session.archive":
     case "session.unarchive":
-      await setArchived(input, emit);
+      await setArchived(input, state.account, emit);
       return;
     case "session.open":
       await openSession(input, state, emit);
@@ -157,10 +167,11 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
 /** Archives or unarchives the conversation a request names, and says how it went. */
 async function setArchived(
   input: Extract<ProviderInput, { type: "session.archive" | "session.unarchive" }>,
+  account: AccountConfig,
   emit: Emit,
 ): Promise<void> {
   const conversationId = readConversationId(input.persistence);
-  if (conversationId === null) {
+  if (conversationId === null || !isConversationAllowed(conversationId, account)) {
     emit({
       type: "request.failed",
       requestId: input.requestId,
@@ -169,8 +180,8 @@ async function setArchived(
     return;
   }
   try {
-    if (input.type === "session.archive") await archiveConversation(conversationId);
-    else await unarchiveConversation(conversationId);
+    if (input.type === "session.archive") await archiveConversation(conversationId, account);
+    else await unarchiveConversation(conversationId, account);
   } catch (error) {
     emit({
       type: "request.failed",

@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { pluginDataDir, safePathSegment } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId, safePathSegment } from "./plugindata";
 
 /**
  * Opt-in sharing of Paseo's MCP servers with the CLI. Antigravity reads MCP servers from
@@ -47,13 +47,13 @@ interface AgyMcpEntry {
 const ENTRY_PREFIX = "paseo-";
 
 /** The folder holding one session's MCP config, which is what the CLI is given as `--add-dir`. */
-export function mcpSessionDir(sessionId: string): string {
-  return pluginDataDir("mcp", safePathSegment(sessionId));
+export function mcpSessionDir(sessionId: string, account?: AccountOrId): string {
+  return accountPluginDataDir(account, "mcp", safePathSegment(sessionId));
 }
 
 /** Where agy looks for a directory's own MCP servers. */
-export function mcpSessionConfigPath(sessionId: string): string {
-  return join(mcpSessionDir(sessionId), ".agents", "mcp_config.json");
+export function mcpSessionConfigPath(sessionId: string, account?: AccountOrId): string {
+  return join(mcpSessionDir(sessionId, account), ".agents", "mcp_config.json");
 }
 
 /** One `mcpServers` entry as agy writes it: `disabled` is always present. */
@@ -84,9 +84,10 @@ export type WriteResult =
 export async function writeSessionMcpConfig(
   sessionId: string,
   servers: Readonly<Record<string, McpServerConfig>>,
+  account?: AccountOrId,
 ): Promise<WriteResult> {
-  const dir = mcpSessionDir(sessionId);
-  const path = mcpSessionConfigPath(sessionId);
+  const dir = mcpSessionDir(sessionId, account);
+  const path = mcpSessionConfigPath(sessionId, account);
   const named: Record<string, AgyMcpEntry> = {};
   for (const [name, server] of Object.entries(servers)) named[`${ENTRY_PREFIX}${name}`] = toAgyEntry(server);
   const text = `${JSON.stringify({ mcpServers: named }, null, 2)}\n`;
@@ -105,8 +106,8 @@ export async function writeSessionMcpConfig(
 }
 
 /** Deletes a session's folder, credentials and all. Nothing to delete is not an error. */
-export async function removeSessionMcpConfig(sessionId: string): Promise<void> {
-  await rm(mcpSessionDir(sessionId), { recursive: true, force: true });
+export async function removeSessionMcpConfig(sessionId: string, account?: AccountOrId): Promise<void> {
+  await rm(mcpSessionDir(sessionId, account), { recursive: true, force: true });
 }
 
 /**
@@ -114,8 +115,8 @@ export async function removeSessionMcpConfig(sessionId: string): Promise<void> {
  * closing its sessions left behind, credentials included. Runs when the plugin connects and when a
  * session opens, the two moments the set of live sessions is known.
  */
-export async function sweepSessionMcpConfigs(live: ReadonlySet<string>): Promise<void> {
-  const root = pluginDataDir("mcp");
+export async function sweepSessionMcpConfigs(live: ReadonlySet<string>, account?: AccountOrId): Promise<void> {
+  const root = accountPluginDataDir(account, "mcp");
   let names: string[];
   try {
     names = await readdir(root);
@@ -170,8 +171,8 @@ type GitExclude = z.infer<typeof gitExcludeSchema>;
  * ledger that records them stays until nothing is left in it, so a start that could not finish
  * tries again.
  */
-export async function cleanUpLegacyMcpEntries(): Promise<void> {
-  const path = pluginDataDir("mcp-ledger.json");
+export async function cleanUpLegacyMcpEntries(account?: AccountOrId): Promise<void> {
+  const path = accountPluginDataDir(account, "mcp-ledger.json");
   const raw = await readText(path);
   if (raw === null) return;
   const parsed = ledgerSchema.safeParse(safeJson(raw));

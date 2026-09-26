@@ -24,9 +24,9 @@ const PLANNER_RESPONSE = "PLANNER_RESPONSE";
 const GENERIC = "GENERIC";
 
 /** Where agy writes a conversation's transcript. */
-export function conversationTranscriptPath(conversationId: string): string {
+export function conversationTranscriptPath(conversationId: string, accountHome: string = homedir()): string {
   return join(
-    homedir(),
+    accountHome,
     ".gemini",
     "antigravity-cli",
     "brain",

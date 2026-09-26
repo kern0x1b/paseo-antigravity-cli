@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { pluginDataDir } from "./plugindata";
+import { accountPluginDataDir, type AccountOrId } from "./plugindata";
 
 /**
  * Which conversations Paseo has archived. Antigravity has no archive of its own — its conversation
@@ -18,9 +18,9 @@ interface ArchiveFile {
 }
 
 /** The ids of every archived conversation. A file that cannot be read means none are. */
-export async function archivedConversations(): Promise<Set<string>> {
+export async function archivedConversations(account?: AccountOrId): Promise<Set<string>> {
   try {
-    const decoded: unknown = JSON.parse(await readFile(pluginDataDir(FILE), "utf8"));
+    const decoded: unknown = JSON.parse(await readFile(accountPluginDataDir(account, FILE), "utf8"));
     if (typeof decoded !== "object" || decoded === null) return new Set();
     const list = (decoded as { conversations?: unknown }).conversations;
     return new Set(Array.isArray(list) ? list.filter((id): id is string => typeof id === "string") : []);
@@ -29,29 +29,29 @@ export async function archivedConversations(): Promise<Set<string>> {
   }
 }
 
-export async function archiveConversation(conversationId: string): Promise<void> {
-  await change((archived) => archived.add(conversationId));
+export async function archiveConversation(conversationId: string, account?: AccountOrId): Promise<void> {
+  await change((archived) => archived.add(conversationId), account);
 }
 
-export async function unarchiveConversation(conversationId: string): Promise<void> {
-  await change((archived) => archived.delete(conversationId));
+export async function unarchiveConversation(conversationId: string, account?: AccountOrId): Promise<void> {
+  await change((archived) => archived.delete(conversationId), account);
 }
 
 /** Read-modify-write one at a time: two requests arriving together must not drop each other's. */
 let pending: Promise<unknown> = Promise.resolve();
 
-function change(edit: (archived: Set<string>) => unknown): Promise<void> {
+function change(edit: (archived: Set<string>) => unknown, account?: AccountOrId): Promise<void> {
   const run = pending.then(async () => {
-    const archived = await archivedConversations();
+    const archived = await archivedConversations(account);
     edit(archived);
-    await save(archived);
+    await save(archived, account);
   });
   pending = run.catch(() => undefined);
   return run;
 }
 
-async function save(archived: ReadonlySet<string>): Promise<void> {
-  const path = pluginDataDir(FILE);
+async function save(archived: ReadonlySet<string>, account?: AccountOrId): Promise<void> {
+  const path = accountPluginDataDir(account, FILE);
   const body: ArchiveFile = { version: 1, conversations: [...archived].sort() };
   const temp = `${path}.${process.pid}.tmp`;
   try {
